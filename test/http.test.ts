@@ -254,7 +254,7 @@ function ingestTask(store: ReturnType<typeof openStore>, queue: string, dedupeKe
   return store.ingest({ queue, dedupeKey, retry, labels, title: dedupeKey, source: 'fixture', kind: 'incident' }, source).task.id
 }
 
-test('one of 20 HTTP claims wins and its request ID survives an abrupt server restart', { timeout: 15_000 }, async (t) => {
+test('one of 20 HTTP claims wins and its receipt and event survive an abrupt server restart', { timeout: 15_000 }, async (t) => {
   const db = join(dir, 'race.db')
   const keys = join(dir, 'race.json')
   const competitors = Array.from({ length: 20 }, (_, i) => (i + 1).toString(16).padStart(64, '0'))
@@ -268,6 +268,8 @@ test('one of 20 HTTP claims wins and its request ID survives an abrupt server re
 
   const server = await start(db, keys)
   t.after(async () => { await server.stop() })
+  const before = await ok(await server.get('/tasks', watcher))
+  assert.equal(before.cursor, 1)
   const request = { queue: checkoutQueue, request_id: 'claim-one' }
   const responses = await Promise.all(competitors.map((key) => server.post(claimPath, key, request)))
   const winners = responses.flatMap((response, i) => response.status === 200 ? [i] : [])
@@ -288,15 +290,16 @@ test('one of 20 HTTP claims wins and its request ID survives an abrupt server re
   assert.deepEqual(tasks, [claimed])
   assert.equal(cursor, 2)
 
-  await restarted.stop()
-  const audit = openStore({ path: db })
-  try {
-    assert.deepEqual(audit.events({ after: 1 }).map(({ type, actor, requestId }) => [type, actor, requestId]), [
-      ['task.claimed', `agent:agent-${winner}`, 'claim-one'],
-    ])
-  } finally {
-    audit.close()
-  }
+  const catchup = await ok(await restarted.get(`/events?after=${before.cursor}`, watcher))
+  assert.equal(catchup.cursor, before.cursor + 1)
+  assert.deepEqual(catchup.events.map(({ seq, task_id, type, actor, request_id }: {
+    seq: number; task_id: number; type: string; actor: string; request_id: string
+  }) => [seq, task_id, type, actor, request_id]), [
+    [before.cursor + 1, id, 'task.claimed', `agent:agent-${winner}`, 'claim-one'],
+  ])
+  assert.deepEqual(await ok(await restarted.get(`/events?after=${catchup.cursor}`, watcher)), {
+    events: [], cursor: catchup.cursor,
+  })
 })
 
 async function workingHub(t: TestContext, name: string) {
@@ -541,11 +544,19 @@ test('HTTP notes, memos and admin writes enforce their own scopes and survive re
   await error(await write('memo', exact, 'denied', { key: 'x', value: 1 }, outside), 403, 'forbidden')
   await error(await write('memo', agentA, 'missing', { key: 'x' }), 400, 'invalid_argument')
   const logged = await ok(await write('log', agentA, 'note', note))
-  assert.deepEqual(logged, { seq: 3, task_id: id, type: 'task.logged', actor: 'agent:a', request_id: 'note', from: 'ready', to: 'ready', data: { text: 'one note' }, at: now })
+  assert.deepEqual(logged, { task_id: id, type: 'task.logged', actor: 'agent:a', request_id: 'note', from: 'ready', to: 'ready', data: { text: 'one note' }, at: now })
   assert.deepEqual(await ok(await write('log', agentA, 'note', note)), logged)
   await error(await write('memo', agentA, 'note', { key: 'x', value: 1 }), 409, 'request_id_reused')
 
   const approval = { key: 'approval', value: null }
+  for (const value of ['1e400', '{"nested":[-1e400]}']) {
+    await error(await hub.request(`/tasks/${id}/memo`, agentA, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: `{"request_id":"first","key":"approval","value":${value}}`,
+    }), 400, 'invalid_argument')
+  }
+  assert.deepEqual((await ok(await hub.get(`/tasks/${id}`, reader))).memos, {})
+  assert.deepEqual(await ok(await hub.get('/events?after=3', watcher)), { events: [], cursor: 3 })
   assert.deepEqual(await ok(await write('memo', agentA, 'first', approval)), { value: null })
   assert.deepEqual(await ok(await write('memo', agentA, 'first', approval)), { value: null })
   await error(await write('memo', agentA, 'first', { ...approval, value: false }), 409, 'request_id_reused')
@@ -571,6 +582,7 @@ test('HTTP notes, memos and admin writes enforce their own scopes and survive re
   await error(await write('complete', agentA, 'stale', { epoch: last.epoch }), 409, 'claim_lost')
   await error(await write('requeue', unknownKey, 'terminal'), 409, 'invalid_transition')
   const { events } = await ok(await hub.get('/events?after=2', watcher))
+  assert.deepEqual(events[0], { ...logged, seq: 3 })
   assert.deepEqual(events.map(({ type }: { type: string }) => type), [
     'task.logged', 'task.memo', 'task.claimed', 'task.blocked', 'task.unblocked', 'task.claimed',
     'task.lease_expired', 'task.requeued', 'task.claimed', 'task.canceled',

@@ -356,9 +356,10 @@ export class Store {
   /** Stores `value` under `key` on the task unless the key has one. Returns the stored value. */
   memo(id: number, key: string, value: unknown, who: Writer): unknown {
     need(isName(key), 'key must be a non-empty string')
-    const encoded = JSON.stringify(value, (_key, item: unknown) =>
-      item && typeof item === 'object' && !Array.isArray(item) ? sortedEntries(item) : item,
-    )
+    const encoded = JSON.stringify(value, (_key, item: unknown) => {
+      need(typeof item !== 'number' || Number.isFinite(item), 'value must contain only finite JSON numbers')
+      return item && typeof item === 'object' && !Array.isArray(item) ? sortedEntries(item) : item
+    })
     need(encoded !== undefined, 'value must be JSON')
     return this.#write('memo', id, { key, value: encoded }, who, (now) => {
       const row = this.#row(id)
