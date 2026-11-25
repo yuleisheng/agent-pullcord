@@ -349,9 +349,11 @@ test('init and keys issue secrets once and serve reloads revocation only on rest
   const stored = readFileSync(join(dir, keys), 'utf8')
   for (const key of [initialized.admin_key, created.key, agent.key]) assert.ok(!stored.includes(key))
 
+  failure(await setup.call(['serve', '--public-url', 'https://hub.example.test/?hidden=value', '--keys', keys]), 'invalid_argument')
   async function serve() {
-    const server = setup.start(['serve', '--listen', '127.0.0.1:0', '--db', db, '--keys', keys])
+    const server = setup.start(['serve', '--listen', '127.0.0.1:0', '--public-url', 'https://hub.example.test/pullcord', '--db', db, '--keys', keys])
     const { url } = JSON.parse(await matchingLine(server.child.stdout!, (line) => line.startsWith('{')))
+    assert.match(url, /^http:\/\/127\.0\.0\.1:[1-9]\d*$/)
     return { ...cli(t, dir, url), stop: () => { server.child.kill('SIGTERM'); return server.done } }
   }
   const server = await serve()

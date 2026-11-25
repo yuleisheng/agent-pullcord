@@ -122,7 +122,12 @@ async function dispatch(command: string, args: string[], json: boolean): Promise
     }
     case 'serve': {
       const { serve } = await import('../serve.ts')
-      serve(json ? ['--json', ...args] : args)
+      try {
+        serve(json ? ['--json', ...args] : args)
+      } catch (error) {
+        if (error instanceof StoreError) throw error
+        invalid(error instanceof Error ? error.message : 'The hub could not start.')
+      }
       return
     }
     case 'sources': {

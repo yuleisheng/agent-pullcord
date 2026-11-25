@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
+import { parsePublicUrl } from '../config.ts'
 
 export const DEFAULT_URL = 'http://127.0.0.1:7337'
 
@@ -21,12 +22,13 @@ export function invalid(message: string): never {
 }
 
 export function hubUrl(value = process.env.PULLCORD_URL ?? DEFAULT_URL): URL {
-  const url = URL.parse(value)
-  if (!url || !['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
-    invalid('Use an HTTP(S) hub URL without credentials, a query, or a fragment.')
+  try {
+    const url = parsePublicUrl(value)
+    url.pathname = url.pathname.replace(/\/*$/, '/')
+    return url
+  } catch (error) {
+    invalid(error instanceof Error ? error.message : 'Use a valid hub URL.')
   }
-  url.pathname = url.pathname.replace(/\/*$/, '/')
-  return url
 }
 
 export type Claim = { id: number; epoch: number }
