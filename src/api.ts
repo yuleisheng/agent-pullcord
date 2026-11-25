@@ -289,8 +289,12 @@ async function otherWrite(store: TaskStore, agent: Agent, action: OtherWrite, pa
   request.signal.throwIfAborted()
   requireTaskQueue(store, agent, id)
   switch (action) {
-    case 'log':
-      return eventJson(store.log(id, { ...who, text: nonempty(body.text, 'text') }))
+    case 'log': {
+      const event = eventJson(store.log(id, { ...who, text: nonempty(body.text, 'text') }))
+      if (canWatch(agent)) return event
+      const { seq, ...receipt } = event
+      return receipt
+    }
     case 'memo':
       if (!Object.hasOwn(body, 'value')) invalid('value must be present (use null for a JSON null).')
       return { value: store.memo(id, nonempty(body.key, 'key'), body.value, who) }
