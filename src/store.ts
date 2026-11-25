@@ -279,16 +279,14 @@ export class Store {
   /** Extends the holder's lease to `leaseMs` from now. */
   renew(id: number, who: Holder & { leaseMs?: number }): Task {
     const leaseMs = checkLease(who.leaseMs)
-    return this.#write('renew', id, { epoch: who.epoch, leaseMs }, who, (now) => {
-      const row = this.#held(id, who)
+    return this.#writeHolder('renew', id, { leaseMs }, who, (row, now) => {
       return toTask(this.#move(row, 'task.renewed', 'claimed', who, now, { lease_expires_at: now + leaseMs }))
     })
   }
 
   complete(id: number, who: Holder & { result?: string }): Task {
     need(who.result === undefined || typeof who.result === 'string', 'result must be a string')
-    return this.#write('complete', id, { epoch: who.epoch, result: who.result ?? null }, who, (now) => {
-      const row = this.#held(id, who)
+    return this.#writeHolder('complete', id, { result: who.result ?? null }, who, (row, now) => {
       return toTask(this.#moveAndClearClaim(row, 'task.completed', 'completed', who, now, { result: who.result ?? null }))
     })
   }
@@ -296,8 +294,7 @@ export class Store {
   /** Ends the claim as a failure. With `retry`, the task is ready again while it has attempts left. */
   fail(id: number, who: Holder & { reason: string; retry?: boolean }): Task {
     need(isName(who.reason), 'reason must be a non-empty string')
-    return this.#write('fail', id, { epoch: who.epoch, reason: who.reason, retry: who.retry === true }, who, (now) => {
-      const row = this.#held(id, who)
+    return this.#writeHolder('fail', id, { reason: who.reason, retry: who.retry === true }, who, (row, now) => {
       const to = who.retry === true && row.attempts < row.max_attempts ? 'ready' : 'failed'
       return toTask(this.#moveAndClearClaim(row, 'task.failed', to, who, now, { reason: who.reason }))
     })
@@ -305,8 +302,7 @@ export class Store {
 
   /** Hands the task back, ready again. The attempt is given back too. */
   release(id: number, who: Holder): Task {
-    return this.#write('release', id, { epoch: who.epoch }, who, (now) => {
-      const row = this.#held(id, who)
+    return this.#writeHolder('release', id, {}, who, (row, now) => {
       return toTask(this.#moveAndClearClaim(row, 'task.released', 'ready', who, now, { attempts: row.attempts - 1 }))
     })
   }
@@ -314,8 +310,7 @@ export class Store {
   /** Holds the task for a person, ending the claim. The attempt is given back. */
   block(id: number, who: Holder & { reason: string }): Task {
     need(isName(who.reason), 'reason must be a non-empty string')
-    return this.#write('block', id, { epoch: who.epoch, reason: who.reason }, who, (now) => {
-      const row = this.#held(id, who)
+    return this.#writeHolder('block', id, { reason: who.reason }, who, (row, now) => {
       return toTask(this.#moveAndClearClaim(row, 'task.blocked', 'blocked', who, now, { attempts: row.attempts - 1, reason: who.reason }))
     })
   }
@@ -363,6 +358,11 @@ export class Store {
     })
   }
 
+  /** Returns a task's immutable queue for authorization without reading or expiring its claim. */
+  taskQueue(id: number): string {
+    return this.#row(id).queue
+  }
+
   task(id: number): Task & { memos: Record<string, unknown> } {
     return this.#run(() => {
       const row = this.#row(id)
@@ -393,31 +393,25 @@ export class Store {
     )
   }
 
-  #run<T>(fn: (now: number) => T): T {
+  #run<T>(fn: (now: number) => T, expireLeases = true): T {
     const now = this.#clock()
     this.#db.exec('BEGIN IMMEDIATE')
-    let done = false
     try {
-      this.#expireLeases(now)
-      this.#db.exec('SAVEPOINT op')
-      let result: T
-      try {
-        result = fn(now)
-      } catch (error) {
-        this.#db.exec('ROLLBACK TO op')
-        this.#db.exec('COMMIT')
-        done = true
-        throw error
-      }
+      if (expireLeases) this.#expireLeases(now)
+      const result = fn(now)
       this.#db.exec('COMMIT')
-      done = true
       return result
-    } finally {
-      if (!done) this.#db.exec('ROLLBACK')
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
     }
   }
 
-  #write<T>(op: string, taskId: number | null, args: Record<string, unknown>, who: Writer, fn: (now: number) => T): T {
+  #writeHolder(op: string, id: number, args: Record<string, unknown>, who: Holder, fn: (row: Row, now: number) => Task): Task {
+    return this.#write(op, id, { epoch: who.epoch, ...args }, who, (now) => fn(this.#held(id, who, now), now), false)
+  }
+
+  #write<T>(op: string, taskId: number | null, args: Record<string, unknown>, who: Writer, fn: (now: number) => T, expireLeases = true): T {
     checkActor(who)
     need(who.requestId === undefined || isName(who.requestId), 'requestId must be a non-empty string')
     const write = JSON.stringify({ op, taskId, ...args })
@@ -433,6 +427,7 @@ export class Store {
           return JSON.parse(prior.response) as T
         }
       }
+      if (expireLeases) this.#expireLeases(now)
       const result = fn(now)
       if (who.requestId !== undefined && result !== null) {
         this.#db
@@ -440,7 +435,7 @@ export class Store {
           .run(who.actor, who.requestId, write, JSON.stringify(result), now)
       }
       return result
-    })
+    }, false)
   }
 
   #expireLeases(now: number): void {
@@ -452,10 +447,10 @@ export class Store {
     }
   }
 
-  #held(id: number, who: Holder): Row {
+  #held(id: number, who: Holder, now: number): Row {
     need(Number.isInteger(who.epoch), 'epoch must be an integer')
     const row = this.#row(id)
-    if (row.state !== 'claimed' || row.holder !== who.actor || row.epoch !== who.epoch) {
+    if (row.state !== 'claimed' || row.holder !== who.actor || row.epoch !== who.epoch || row.lease_expires_at === null || row.lease_expires_at <= now) {
       throw new StoreError('claim_lost', `${who.actor} holds no current claim on task ${id} at epoch ${who.epoch}. Its lease ran out, or the task moved on. Read the task, then claim again if it's ready.`)
     }
     return row

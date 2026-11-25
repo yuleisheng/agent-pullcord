@@ -69,21 +69,33 @@ test('a claim takes the oldest ready task that matches its queue and labels', ()
 
 test('a holder write succeeds until its lease ends and fails from that moment', () => {
   const id = store.ingest(incident('P1', { retry: 'safe' }), source).task.id
-  const { epoch } = store.claim({ queue: 'incidents/checkout', leaseMs: 10_000 }, A)!
+  const filter = { queue: 'incidents/checkout', leaseMs: 10_000 }
+  const claimant = { ...A, requestId: 'claim' }
+  const claimed = store.claim(filter, claimant)!
 
   now += 9_999
-  assert.equal(store.renew(id, { ...A, epoch, leaseMs: 10_000 }).leaseExpiresAt, now + 10_000)
+  const renewal = { ...A, epoch: claimed.epoch, leaseMs: 10_000, requestId: 'renew' }
+  const renewed = store.renew(id, renewal)
+  assert.equal(renewed.leaseExpiresAt, now + 10_000)
   const before = store.events().length
   now += 10_000
-  assert.equal(code(() => store.complete(id, { ...A, epoch, result: 'done' })), 'claim_lost')
+  assert.equal(code(() => store.complete(id, { ...A, epoch: claimed.epoch, result: 'done' })), 'claim_lost')
+  assert.deepEqual(store.renew(id, renewal), renewed)
+  assert.deepEqual(store.claim(filter, claimant), claimed)
+
+  now -= 1
+  assert.deepEqual(store.events({ after: before }), [], 'a rejected or replayed write did not record expiry')
+  assert.deepEqual(store.task(id), { ...renewed, memos: {} })
+  now += 1
 
   const task = store.task(id)
   assert.equal(task.state, 'ready', 'a safe task with attempts left is ready again')
   assert.equal(task.holder, null)
+  now -= 1
   assert.deepEqual(
     store.events({ after: before }).map((e) => e.type),
     ['task.lease_expired'],
-    'the failed write appended nothing',
+    'the later read recorded expiry exactly once',
   )
 })
 

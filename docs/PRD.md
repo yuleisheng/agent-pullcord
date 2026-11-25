@@ -129,9 +129,9 @@ Agent endpoints take `Authorization: Bearer <key>`. Task JSON uses snake_case fi
   - `GET /tasks/:id`: returns one task with its `memos` object. Out-of-scope and missing IDs both return `404 not_found`.
 - **Watch** (requires the `*` queue grant and the `events` action):
   - `GET /events?after=<cursor>&wait=<seconds>`: long-polls the complete, unfiltered event feed after the cursor. A watcher that takes its initial snapshot from `GET /tasks` also needs `read`.
-- **Holder writes** (each takes `epoch` and `request_id`):
-  - `POST /tasks/claim` with `{ queue, labels?, wait?, lease? }`: claims the match that has been ready longest, or waits up to `wait`. A `queue` ending in `/`, such as `incidents/`, matches every queue that starts with it; any other `queue` matches exactly. A match has every label in `labels`.
-  - `POST /tasks/:id/renew`, `/complete`, `/fail`, `/release`, `/block`.
+- **Claim and holder writes** return the resulting task. Each requires its action and queue grant plus a JSON object with a non-empty `request_id`. Bodies are limited to 64 KiB.
+  - `POST /tasks/claim` with `{ request_id, queue, labels?, wait?, lease? }`: claims the match that has been ready longest, or waits up to `wait` (0–30 whole seconds, default 0). A `queue` ending in `/`, such as `incidents/`, matches every queue that starts with it; any other `queue` matches exactly. The requested selector must be within the key's grant. A match has every label in the `labels` object. If there is no match, returns `409 nothing_ready`. `wait` limits retries, not the identity of the write for `request_id` deduplication.
+  - `POST /tasks/:id/renew`, `/complete`, `/fail`, `/release`, `/block` also take the `epoch` returned by claim. The actor comes from the key, not the body; missing and out-of-scope IDs both return `404 not_found`. `renew` accepts optional `lease`; `complete` accepts an optional string `result`; `fail` and `block` require a string `reason`; `fail` accepts optional boolean `retry` (default false). On claim and renew, `lease` is in whole seconds and uses the lifecycle bounds and default.
 - **Other writes:**
   - `POST /tasks/:id/log`: appends a note to the task's log.
   - `POST /tasks/:id/memo` with `{ key, value }`: first write wins.
@@ -149,7 +149,7 @@ The CLI is `pullcord`. It reads `PULLCORD_URL` and `PULLCORD_KEY` from the envir
 - `pullcord keys list`, `pullcord keys revoke <agent>`.
 
 **Work, for agents:**
-- `pullcord claim <queue> [--label k=v] [--wait 10m] [--lease 15m]`: claims the match that has been ready longest and prints it.
+- `pullcord claim <queue> [--label k=v] [--wait 30s] [--lease 15m]`: claims the match that has been ready longest and prints it.
 - `pullcord renew <id>`, `pullcord complete <id> ["result"]`, `pullcord fail <id> "reason" [--retry]`, `pullcord release <id>`, `pullcord block <id> "question"`.
 - `pullcord run <queue|id> -- <command>`: claims a task and runs the command with `PULLCORD_TASK` set, renewing at a third of the lease. Exit 0 completes the task, any other exit fails it, and Ctrl-C releases it. Taken from Board's `tasks run`.
 - `pullcord log <id> "note"`, `pullcord memo <id> <key> [value]`.
@@ -165,7 +165,7 @@ The hub serves MCP itself at `/mcp`, over streamable HTTP, authenticated with th
 
 - **Tools** mirror the agent commands: claim, renew, complete, fail, release, block, log, memo, list, and show.
 - **Epochs** are kept by the MCP session, so tools take only a task ID.
-- **`claim` waits** at most 60 seconds, because MCP tool calls time out. An agent that needs to wait longer calls it again.
+- **`claim` waits** at most 30 seconds, like the HTTP API. An agent that needs to wait longer calls it again.
 - **`run` is CLI only.**
 
 **Errors** are JSON with a stable `code`, for example `claim_lost`, `task_claimed`, `nothing_ready`, `unauthorized`, `forbidden`, `invalid_transition`, `not_found`, `invalid_argument`, `request_id_reused`, or `store_locked` (another process owns the database). A missing or invalid agent key returns `401 unauthorized`; insufficient action or explicit queue scope returns `403 forbidden`. An unexpected server error returns `500 internal_error` with a generic message and no underlying exception details. Each error says what the caller can do next. `max_attempts` is 1 to 100.

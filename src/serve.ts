@@ -1,20 +1,32 @@
 import { readFileSync } from 'node:fs'
 import { createServer } from 'node:http'
+import { Readable } from 'node:stream'
 import { parseArgs } from 'node:util'
 import { createApi } from './api.ts'
 import { openStore, type Store } from './store.ts'
 
 export function createHttpServer(store: Store, keys: unknown) {
   const api = createApi(store, keys)
-  return createServer(async (req, res) => {
+  return createServer({ requestTimeout: 30_000 }, async (req, res) => {
     try {
       const target = req.url?.startsWith('/') ? req.url : '/'
-      const request = new Request(`http://pullcord${target}`, {
+      const abort = new AbortController()
+      res.once('close', () => abort.abort())
+      const init: RequestInit & { duplex?: 'half' } = {
         method: req.method,
-        headers: { authorization: req.headersDistinct.authorization?.join(', ') ?? '' },
-      })
-      const response = await api(request)
+        headers: {
+          authorization: req.headersDistinct.authorization?.join(', ') ?? '',
+          'content-type': req.headersDistinct['content-type']?.join(', ') ?? '',
+        },
+        signal: abort.signal,
+      }
+      if (req.method === 'POST') {
+        init.body = Readable.toWeb(req, { strategy: { highWaterMark: 1 } }) as ReadableStream<Uint8Array>
+        init.duplex = 'half'
+      }
+      const response = await api(new Request(`http://pullcord${target}`, init))
       const body = await response.text()
+      if (req.method === 'POST' && !req.readableEnded) res.setHeader('Connection', 'close')
       if (!res.destroyed) res.writeHead(response.status, Object.fromEntries(response.headers)).end(body)
     } catch {
       res.destroy()
