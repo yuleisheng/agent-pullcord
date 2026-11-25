@@ -89,8 +89,8 @@ test('a holder write succeeds until its lease ends and fails from that moment', 
 
 test('an agent that stalled past its lease cannot settle a task another agent holds', () => {
   const id = store.ingest(incident('P1', { retry: 'safe' }), source).task.id
-  const stale = store.claim({ queue: 'incidents/checkout', leaseMs: 1_000 }, A)!
-  now += 1_000
+  const stale = store.claim({ queue: 'incidents/checkout', leaseMs: 10_000 }, A)!
+  now += 10_000
   const fresh = store.claim({ queue: 'incidents/checkout' }, B)!
   assert.equal(fresh.epoch, stale.epoch + 1)
 
@@ -101,8 +101,8 @@ test('an agent that stalled past its lease cannot settle a task another agent ho
 
 test('a manual task whose lease runs out waits for a person', () => {
   const id = store.ingest(incident('P1'), source).task.id
-  store.claim({ queue: 'incidents/checkout', leaseMs: 1_000 }, A)
-  now += 1_000
+  store.claim({ queue: 'incidents/checkout', leaseMs: 10_000 }, A)
+  now += 10_000
 
   assert.equal(store.claim({ queue: 'incidents/checkout' }, B), null)
   const task = store.task(id)
@@ -113,20 +113,53 @@ test('a manual task whose lease runs out waits for a person', () => {
   assert.equal(store.claim({ queue: 'incidents/checkout' }, B)?.id, id)
 })
 
-test('attempts are bounded: the last expiry or retryable failure ends the task', () => {
+test('attempts are bounded: a safe task fails on its last expiry, a manual one waits for a person', () => {
   const id = store.ingest(incident('P1', { retry: 'safe', maxAttempts: 2 }), source).task.id
-  const first = store.claim({ queue: 'incidents/checkout', leaseMs: 1_000 }, A)!
+  const first = store.claim({ queue: 'incidents/checkout', leaseMs: 10_000 }, A)!
   assert.equal(store.fail(id, { ...A, epoch: first.epoch, reason: 'flaky', retry: true }).state, 'ready')
-  store.claim({ queue: 'incidents/checkout', leaseMs: 1_000 }, A)
-  now += 1_000
+  store.claim({ queue: 'incidents/checkout', leaseMs: 10_000 }, A)
+  now += 10_000
   const task = store.task(id)
   assert.equal(task.state, 'failed')
   assert.equal(task.attempts, 2)
 
   const manual = store.ingest(incident('P2', { maxAttempts: 1 }), source).task.id
-  store.claim({ queue: 'incidents/checkout', leaseMs: 1_000 }, A)
-  now += 1_000
-  assert.equal(store.task(manual).state, 'failed', 'a manual task out of attempts fails instead of waiting')
+  store.claim({ queue: 'incidents/checkout', leaseMs: 10_000 }, A)
+  now += 10_000
+  const interrupted = store.task(manual)
+  assert.deepEqual([interrupted.state, interrupted.attempts], ['interrupted', 1], 'a manual task out of attempts still waits for a person')
+  const requeued = store.requeue(manual, { actor: 'person:yulei' })
+  assert.deepEqual([requeued.state, requeued.attempts], ['ready', 0], 'a requeue gives the attempt back')
+  assert.equal(store.claim({ queue: 'incidents/checkout' }, B)?.id, manual)
+})
+
+test('a claim takes the task that has been ready longest', () => {
+  const [one, two, three] = ['P1', 'P2', 'P3'].map((key) => {
+    const id = store.ingest(incident(key, { retry: 'safe' }), source).task.id
+    now += 1
+    return id
+  })
+  const claimed: number[] = []
+  for (let i = 0; i < 4; i++) {
+    const task = store.claim({ queue: 'incidents/checkout' }, A)!
+    claimed.push(task.id)
+    now += 1
+    store.release(task.id, { ...A, epoch: task.epoch })
+    now += 1
+  }
+  assert.deepEqual(claimed, [one, two, three, one], 'a released task goes to the back of the queue')
+
+  const failed = store.claim({ queue: 'incidents/checkout' }, A)!
+  now += 1
+  store.fail(failed.id, { ...A, epoch: failed.epoch, reason: 'flaky', retry: true })
+  assert.notEqual(store.claim({ queue: 'incidents/checkout' }, B)?.id, failed.id, 'a retried task goes to the back of the queue')
+})
+
+test('a lease is 10 seconds to 1 hour', () => {
+  store.ingest(incident('P1'), source)
+  assert.equal(code(() => store.claim({ queue: 'incidents/checkout', leaseMs: 9_999 }, A)), 'invalid_argument')
+  assert.equal(code(() => store.claim({ queue: 'incidents/checkout', leaseMs: 3_600_001 }, A)), 'invalid_argument')
+  assert.equal(store.claim({ queue: 'incidents/checkout', leaseMs: 10_000 }, A)?.leaseExpiresAt, now + 10_000)
 })
 
 test('release and block give the attempt back', () => {

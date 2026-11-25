@@ -66,7 +66,7 @@ A **task** has these fields:
 - **Identity:** `id`, `queue` (for example `incidents/checkout`), `kind`, `source`, `dedupe_key`, `correlation_key`
 - **Content:** `title`, `severity`, `labels`, `source_url`, `payload` (raw, untrusted)
 - **Retry policy:** `retry` (`safe` or `manual`), `attempts`, `max_attempts`
-- **Claim:** `state`, `holder`, `epoch`, `lease_expires_at`
+- **Claim:** `state`, `holder`, `epoch`, `lease_expires_at`, `ready_at` (when the task last became `ready`)
 - **Outcome:** `result`, `reason`
 - **Adapter:** the name and version of the adapter that made the task
 
@@ -86,18 +86,20 @@ A **memo** is keyed by (`task_id`, `key`) and holds a JSON value.
 | `claimed` | fail, retryable, attempts < max | `ready` | the holder, with the current epoch |
 | `claimed` | fail, not retryable or attempts = max | `failed` | the holder, with the current epoch |
 | `claimed` | block | `blocked` (the claim ends; attempts − 1) | the holder, with the current epoch |
-| `claimed` | lease expires, attempts = max | `failed` | the hub |
 | `claimed` | lease expires, `retry: safe`, attempts < max | `ready` | the hub |
-| `claimed` | lease expires, `retry: manual`, attempts < max | `interrupted` | the hub |
+| `claimed` | lease expires, `retry: safe`, attempts = max | `failed` | the hub |
+| `claimed` | lease expires, `retry: manual` | `interrupted` | the hub |
 | `blocked` | unblock | `ready` | a person or an admin key |
-| `interrupted` | requeue | `ready` | a person or an admin key |
+| `interrupted` | requeue | `ready` (attempts − 1) | a person or an admin key |
 | any state that isn't terminal | cancel | `canceled` | an admin key, or the source (for example, PagerDuty resolves the incident) |
 
 `completed`, `failed`, and `canceled` are terminal.
 
-A claim counts an attempt. A release or a block gives it back, because the agent handed the task back instead of trying and failing. This keeps every `ready` task below `max_attempts`, so a claim never pushes `attempts` past it.
+A claim counts an attempt. A release or a block gives it back, because the agent handed the task back instead of trying and failing. A requeue gives it back too, because a person decided to try again. This keeps every `ready` task below `max_attempts`, so a claim never pushes `attempts` past it.
 
-Defaults: `retry: manual`, `max_attempts` 3, and a lease of 15 minutes. A lease can be 1 second to 1 hour, and the holder renews it.
+A claim takes the matching task that has been `ready` longest, by `ready_at`, then by `id`. Every move into `ready` sets `ready_at`, so a released, retried, unblocked, or requeued task goes to the back of the queue. An agent that keeps releasing one task can't starve the others.
+
+Defaults: `retry: manual`, `max_attempts` 3, and a lease of 15 minutes. A lease can be 10 seconds to 1 hour, and the holder renews it.
 
 ### Invariants
 
@@ -107,7 +109,7 @@ These are the expectations tests are written from. Change one only through a rev
 2. **Fencing.** A claim-scoped write with a stale epoch, or after the lease has expired, fails with `claim_lost` and changes nothing: no state change and no event.
 3. **Terminal is final.** No action moves a task out of `completed`, `failed`, or `canceled`.
 4. **Manual tasks never retry themselves.** After its lease expires, a `retry: manual` task reaches `ready` only through a requeue by a person or an admin key.
-5. **Bounded attempts.** `attempts` never exceeds `max_attempts`. A task that runs out of attempts ends in `failed`, not `ready`.
+5. **Bounded attempts.** `attempts` never exceeds `max_attempts`, and a `ready` task is always below it. A `retry: safe` task that runs out of attempts ends in `failed`; a `retry: manual` one waits in `interrupted` for a person.
 6. **Idempotent ingest.** Any number of deliveries of the same (source, dedupe key), concurrent or not, create at most one task.
 7. **Exactly-once writes.** A successful write repeated with the same `request_id` by the same actor returns the first result and appends no event. A failed write, or a claim that found nothing, isn't recorded, so repeating it runs it again. Reusing a `request_id` for a different write fails with `request_id_reused`.
 8. **State matches the log.** Every state change appends exactly one event in the same transaction. Replaying the events from the start reproduces every task's current state.
@@ -125,7 +127,7 @@ These are the expectations tests are written from. Change one only through a rev
   - `GET /tasks/:id`: returns one task with its memos.
   - `GET /events?after=<cursor>&wait=<seconds>`: long-polls events after the cursor.
 - **Holder writes** (each takes `epoch` and `request_id`):
-  - `POST /tasks/claim` with `{ queue, labels?, wait?, lease? }`: claims the oldest ready match, or waits up to `wait`. A `queue` ending in `/`, such as `incidents/`, matches every queue that starts with it; any other `queue` matches exactly. A match has every label in `labels`.
+  - `POST /tasks/claim` with `{ queue, labels?, wait?, lease? }`: claims the match that has been ready longest, or waits up to `wait`. A `queue` ending in `/`, such as `incidents/`, matches every queue that starts with it; any other `queue` matches exactly. A match has every label in `labels`.
   - `POST /tasks/:id/renew`, `/complete`, `/fail`, `/release`, `/block`.
 - **Other writes:**
   - `POST /tasks/:id/log`: appends a note to the task's log.
@@ -144,7 +146,7 @@ The CLI is `pullcord`. It reads `PULLCORD_URL` and `PULLCORD_KEY` from the envir
 - `pullcord keys list`, `pullcord keys revoke <agent>`.
 
 **Work, for agents:**
-- `pullcord claim <queue> [--label k=v] [--wait 10m] [--lease 15m]`: claims the oldest ready match and prints it.
+- `pullcord claim <queue> [--label k=v] [--wait 10m] [--lease 15m]`: claims the match that has been ready longest and prints it.
 - `pullcord renew <id>`, `pullcord complete <id> ["result"]`, `pullcord fail <id> "reason" [--retry]`, `pullcord release <id>`, `pullcord block <id> "question"`.
 - `pullcord run <queue|id> -- <command>`: claims a task and runs the command with `PULLCORD_TASK` set, renewing at a third of the lease. Exit 0 completes the task, any other exit fails it, and Ctrl-C releases it. Taken from Board's `tasks run`.
 - `pullcord log <id> "note"`, `pullcord memo <id> <key> [value]`.

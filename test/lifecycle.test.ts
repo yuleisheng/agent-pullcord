@@ -28,14 +28,14 @@ const key = fc.integer({ min: 0, max: KEYS - 1 })
 const held = (t: 'renew' | 'complete' | 'release' | 'block') => fc.record({ t: fc.constant(t), agent, key, stale: fc.boolean() })
 const op: fc.Arbitrary<Op> = fc.oneof(
   fc.record({ t: fc.constant('ingest' as const), key, retry: fc.constantFrom('safe' as const, 'manual' as const), max: fc.integer({ min: 1, max: 3 }) }),
-  { arbitrary: fc.record({ t: fc.constant('claim' as const), agent, lease: fc.integer({ min: 1_000, max: 5_000 }) }), weight: 3 },
+  { arbitrary: fc.record({ t: fc.constant('claim' as const), agent, lease: fc.integer({ min: 10_000, max: 50_000 }) }), weight: 3 },
   held('renew'),
   held('complete'),
   held('release'),
   held('block'),
   fc.record({ t: fc.constant('fail' as const), agent, key, stale: fc.boolean(), retry: fc.boolean() }),
   fc.record({ t: fc.constantFrom('unblock' as const, 'requeue' as const, 'cancel' as const), key }),
-  { arbitrary: fc.record({ t: fc.constant('advance' as const), ms: fc.integer({ min: 0, max: 6_000 }) }), weight: 2 },
+  { arbitrary: fc.record({ t: fc.constant('advance' as const), ms: fc.integer({ min: 0, max: 60_000 }) }), weight: 2 },
   fc.constant({ t: 'repeat' as const }),
   fc.constant({ t: 'reuse' as const }),
 )
@@ -60,6 +60,7 @@ interface ModelTask {
   max: number
   retry: 'safe' | 'manual'
   lease: number | null
+  readyAt: number | null
 }
 
 function writeOf(call: Call): string {
@@ -105,18 +106,19 @@ class Model {
   ids = new Map<number, number>()
   requests = new Map<string, { write: string; outcome: Outcome }>()
 
-  ingest(key: number, retry: 'safe' | 'manual', max: number): void {
+  ingest(key: number, retry: 'safe' | 'manual', max: number, now: number): void {
     if (this.ids.has(key)) return
-    this.tasks.push({ state: 'ready', holder: null, epoch: 0, attempts: 0, max, retry, lease: null })
+    this.tasks.push({ state: 'ready', holder: null, epoch: 0, attempts: 0, max, retry, lease: null, readyAt: now })
     this.ids.set(key, this.tasks.length)
   }
 
   expire(now: number): void {
     for (const task of this.tasks) {
       if (task.state !== 'claimed' || task.lease! > now) continue
-      task.state = task.attempts >= task.max ? 'failed' : task.retry === 'safe' ? 'ready' : 'interrupted'
+      task.state = task.retry === 'manual' ? 'interrupted' : task.attempts >= task.max ? 'failed' : 'ready'
       task.holder = null
       task.lease = null
+      task.readyAt = task.state === 'ready' ? now : null
     }
   }
 
@@ -132,20 +134,27 @@ class Model {
 
   #apply(call: Call, now: number): Outcome {
     if (call.t === 'claim') {
-      const index = this.tasks.findIndex((task) => task.state === 'ready')
+      let index = -1
+      this.tasks.forEach((task, i) => {
+        if (task.state === 'ready' && (index < 0 || task.readyAt! < this.tasks[index]!.readyAt!)) index = i
+      })
       if (index < 0) return { ok: null }
       const task = this.tasks[index]!
-      Object.assign(task, { state: 'claimed', holder: call.actor, epoch: task.epoch + 1, attempts: task.attempts + 1, lease: now + call.lease })
+      Object.assign(task, { state: 'claimed', holder: call.actor, epoch: task.epoch + 1, attempts: task.attempts + 1, lease: now + call.lease, readyAt: null })
       return this.#ok(index + 1)
     }
     const task = this.tasks[call.id - 1]
     if (!task) return { code: 'not_found' }
-    const end = (state: TaskState, attempts = task.attempts) => Object.assign(task, { state, attempts, holder: null, lease: null })
+    const end = (state: TaskState, attempts = task.attempts) =>
+      Object.assign(task, { state, attempts, holder: null, lease: null, readyAt: state === 'ready' ? now : null })
     switch (call.t) {
       case 'unblock':
+        if (task.state !== 'blocked') return { code: 'invalid_transition' }
+        end('ready')
+        return this.#ok(call.id)
       case 'requeue':
-        if (task.state !== (call.t === 'unblock' ? 'blocked' : 'interrupted')) return { code: 'invalid_transition' }
-        task.state = 'ready'
+        if (task.state !== 'interrupted') return { code: 'invalid_transition' }
+        end('ready', task.attempts - 1)
         return this.#ok(call.id)
       case 'cancel':
         if (TERMINAL.has(task.state)) return { code: 'invalid_transition' }
@@ -216,12 +225,12 @@ function replay(events: TaskEvent[]): Map<number, Omit<ModelTask, 'max' | 'retry
   const tasks = new Map<number, Omit<ModelTask, 'max' | 'retry'>>()
   for (const event of events) {
     const data = event.data as { epoch?: number; leaseExpiresAt?: number | null }
-    const task = tasks.get(event.taskId) ?? { state: 'ready', holder: null, epoch: 0, attempts: 0, lease: null }
+    const task = tasks.get(event.taskId) ?? { state: 'ready', holder: null, epoch: 0, attempts: 0, lease: null, readyAt: event.at }
     switch (event.type) {
       case 'task.created':
         break
       case 'task.claimed':
-        Object.assign(task, { state: 'claimed', holder: event.actor, epoch: data.epoch, lease: data.leaseExpiresAt, attempts: task.attempts + 1 })
+        Object.assign(task, { state: 'claimed', holder: event.actor, epoch: data.epoch, lease: data.leaseExpiresAt, attempts: task.attempts + 1, readyAt: null })
         break
       case 'task.renewed':
         task.lease = data.leaseExpiresAt ?? null
@@ -230,8 +239,8 @@ function replay(events: TaskEvent[]): Map<number, Omit<ModelTask, 'max' | 'retry
       case 'task.memo':
         break
       default:
-        Object.assign(task, { state: event.to, holder: null, lease: null })
-        if (event.type === 'task.released' || event.type === 'task.blocked') task.attempts -= 1
+        Object.assign(task, { state: event.to, holder: null, lease: null, readyAt: event.to === 'ready' ? event.at : null })
+        if (event.type === 'task.released' || event.type === 'task.blocked' || event.type === 'task.requeued') task.attempts -= 1
     }
     tasks.set(event.taskId, task)
   }
@@ -259,8 +268,8 @@ function checkInvariants(store: Store, model: Model, now: number): void {
   for (const task of tasks) {
     const expected = model.tasks[task.id - 1]!
     assert.deepEqual(
-      { state: task.state, holder: task.holder, epoch: task.epoch, attempts: task.attempts, lease: task.leaseExpiresAt },
-      { state: expected.state, holder: expected.holder, epoch: expected.epoch, attempts: expected.attempts, lease: expected.lease },
+      { state: task.state, holder: task.holder, epoch: task.epoch, attempts: task.attempts, lease: task.leaseExpiresAt, readyAt: task.readyAt },
+      { state: expected.state, holder: expected.holder, epoch: expected.epoch, attempts: expected.attempts, lease: expected.lease, readyAt: expected.readyAt },
       `task ${task.id} matches the model`,
     )
     assert.ok(task.attempts >= 0 && task.attempts <= task.maxAttempts, 'attempts stay within bounds')
@@ -273,7 +282,7 @@ function checkInvariants(store: Store, model: Model, now: number): void {
     const replayed = replayedTasks.get(task.id)
     assert.deepEqual(
       replayed,
-      { state: task.state, holder: task.holder, epoch: task.epoch, attempts: task.attempts, lease: task.leaseExpiresAt },
+      { state: task.state, holder: task.holder, epoch: task.epoch, attempts: task.attempts, lease: task.leaseExpiresAt, readyAt: task.readyAt },
       `replaying task ${task.id}'s events reproduces its state`,
     )
     const finished = own.findIndex((e) => TERMINAL.has(e.to))
@@ -298,10 +307,10 @@ test('generated sequences keep the store equal to the lifecycle model', () => {
             const before = store.events({ limit: 1000 }).length
             const { created } = store.ingest({ queue: 'q', kind: 'k', source: 's', dedupeKey: `k${step.key}`, title: 't', retry: step.retry, maxAttempts: step.max }, { actor: 'source:s' })
             assert.equal(created, !model.ids.has(step.key))
-            model.ingest(step.key, step.retry, step.max)
+            model.ingest(step.key, step.retry, step.max, now)
             assert.equal(newEvents(store, before).length, created ? 1 : 0, 'an ingest appends one event only when it creates a task')
           } else {
-            const fallback: Call = { t: 'claim', actor: AGENTS[0]!, id: 0, epoch: 0, lease: 1_000, retry: false, requestId: `r${i}` }
+            const fallback: Call = { t: 'claim', actor: AGENTS[0]!, id: 0, epoch: 0, lease: 10_000, retry: false, requestId: `r${i}` }
             const call: Call =
               step.t === 'repeat'
                 ? last?.call ?? fallback
@@ -311,7 +320,7 @@ test('generated sequences keep the store equal to the lifecycle model', () => {
                     const actor = AGENTS['agent' in step ? step.agent : 0]!
                     const id = 'key' in step ? (model.ids.get(step.key) ?? 99) : 0
                     const epoch = (remembered[AGENTS.indexOf(actor)]!.get(id) ?? 0) - ('stale' in step && step.stale ? 1 : 0)
-                    const lease = 'lease' in step ? step.lease : 3_000
+                    const lease = 'lease' in step ? step.lease : 30_000
                     return { t: step.t, actor, id, epoch, lease, retry: 'retry' in step && step.retry, requestId: `r${i}` }
                   })()
             const before = store.events({ limit: 1000 }).length
