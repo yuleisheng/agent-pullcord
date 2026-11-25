@@ -153,7 +153,7 @@ The CLI is `pullcord`. It reads `PULLCORD_URL` and `PULLCORD_KEY` from the envir
 **Work, for agents:**
 - `pullcord claim <queue> [--label k=v] [--wait 30s] [--lease 15m]`: claims the match that has been ready longest and prints it.
 - `pullcord renew <id>`, `pullcord complete <id> ["result"]`, `pullcord fail <id> "reason" [--retry]`, `pullcord release <id>`, `pullcord block <id> "question"`.
-- `pullcord run <queue|id> -- <command>`: claims a task and runs the command with `PULLCORD_TASK` set, renewing at a third of the lease. A decimal selector is an exact task ID instead of a queue. Exit 0 completes the task, and any other exit fails it. Ctrl-C stops the command before releasing the claim. If renewal loses the claim, stop the command without settling the task. On POSIX systems, stopping the command also stops workers in its process group. Taken from Board's `tasks run`.
+- `pullcord run <queue|id> -- <command>`: claims a task and runs the command with `PULLCORD_TASK` set, renewing at a third of the lease. A decimal selector is an exact task ID instead of a queue. Exit 0 completes the task, and any other exit fails it. Ctrl-C stops the command before releasing the claim. If renewal loses the claim, stop the command without settling the task. On POSIX systems, the command runs in a separate process group with inherited standard streams and no controlling terminal. Stopping the command also stops workers still in that group. On Windows, shutdown covers the direct child. If the CLI cannot confirm shutdown, it leaves the claim to expire. Taken from Board's `tasks run`.
 - `pullcord log <id> "note"`, `pullcord memo <id> <key> [value]`.
 
 **Oversight, for people:**

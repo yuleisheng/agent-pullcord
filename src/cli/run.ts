@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { constants } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 import { DEFAULT_LEASE_MS } from '../store-contract.ts'
-import type { ClaimSelector, Client } from './client.ts'
+import { CliError, type ClaimSelector, type Client } from './client.ts'
 
 type Exit = { code: number; reason?: string }
 
@@ -36,16 +36,19 @@ function signalCommand(child: ChildProcess, signal: NodeJS.Signals | 0): boolean
   }
 }
 
-async function stopCommand(child: ChildProcess, signal: NodeJS.Signals): Promise<void> {
-  if (!signalCommand(child, signal)) return
+async function waitForCommandToStop(child: ChildProcess): Promise<boolean> {
   const deadline = performance.now() + STOP_GRACE_MS
   while (signalCommand(child, 0)) {
-    if (performance.now() >= deadline) {
-      signalCommand(child, 'SIGKILL')
-      return
-    }
+    if (performance.now() >= deadline) return false
     await delay(STOP_POLL_MS)
   }
+  return true
+}
+
+async function stopCommand(child: ChildProcess, signal: NodeJS.Signals): Promise<void> {
+  if (!signalCommand(child, signal) || await waitForCommandToStop(child)) return
+  if (!signalCommand(child, 'SIGKILL') || await waitForCommandToStop(child)) return
+  throw new CliError('command_not_stopped', 'Could not confirm the command stopped. The claim will expire.')
 }
 
 export async function run(client: Client, selector: ClaimSelector, command: string[], json: boolean): Promise<unknown> {

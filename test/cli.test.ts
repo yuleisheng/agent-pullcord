@@ -219,6 +219,35 @@ test('run executes literal command arguments, settles from exit status, and stop
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' })
 })
 
+test('run leaves the claim active when it cannot confirm process-group shutdown', {
+  skip: process.platform === 'win32', timeout: 10_000,
+}, async (t) => {
+  const server = await hub(t)
+  const queue = 'incidents/shutdown'
+  const id = server.seed(queue, 'unconfirmed-stop')
+  const preload = `
+    const kill = process.kill.bind(process);
+    let time = 0;
+    Object.defineProperty(performance, 'now', { value: () => time += 3000 });
+    process.kill = (pid, signal) => {
+      if (pid >= 0) return kill(pid, signal);
+      if (signal === 0) return true;
+      try { return kill(pid, signal); }
+      catch (error) {
+        if (signal !== 'SIGKILL' || error.code !== 'ESRCH') throw error;
+        return true;
+      }
+    };
+  `
+  const running = server.start(['run', queue, '--', process.execPath, '-e', wrappedWorker], first, preload)
+  await workerPid(t, running.child)
+  assert.equal(running.child.kill('SIGINT'), true)
+  const stopped = await running.done
+  assert.equal(stopped.code, 1)
+  assert.equal(JSON.parse(stopped.stderr.trim().split('\n').at(-1)!).code, 'command_not_stopped')
+  assert.equal(success(await server.call(['show', String(id)])).state, 'claimed')
+})
+
 test('run renews at a third of the lease and stops its wrapped worker when renewal loses the claim', { timeout: 10_000 }, async (t) => {
   const server = await hub(t)
   const queue = 'incidents/renewal'
