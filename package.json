@@ -9,6 +9,7 @@
     "node": ">=22.18"
   },
   "scripts": {
+    "serve": "node src/serve.ts",
     "test": "node --test --disable-warning=ExperimentalWarning \"test/**/*.test.ts\"",
     "typecheck": "tsc"
   },

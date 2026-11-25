@@ -120,11 +120,13 @@ These are the expectations tests are written from. Change one only through a rev
 
 ## API v1
 
+Agent endpoints take `Authorization: Bearer <key>`. Task JSON uses snake_case fields; timestamps are Unix milliseconds. Titles and payloads appear only inside `untrusted`.
+
 - **Ingest:**
   - `POST /ingest/:source`: verifies the source's signature, maps the event to a task or a cancel, and answers `202`.
-- **Read:**
-  - `GET /tasks?queue=&state=&label=`: returns tasks plus the current event cursor.
-  - `GET /tasks/:id`: returns one task with its memos.
+- **Read** (requires the `read` action):
+  - `GET /tasks?queue=&state=&label=`: returns `{ tasks, cursor }` with tasks in the key's queues and the current global event cursor. An explicit `queue` must be within scope; a slash-terminated queue matches its descendants. Repeat `label=key=value` to require multiple labels.
+  - `GET /tasks/:id`: returns one task with its `memos` object. Out-of-scope and missing IDs both return `404 not_found`.
   - `GET /events?after=<cursor>&wait=<seconds>`: long-polls events after the cursor.
 - **Holder writes** (each takes `epoch` and `request_id`):
   - `POST /tasks/claim` with `{ queue, labels?, wait?, lease? }`: claims the match that has been ready longest, or waits up to `wait`. A `queue` ending in `/`, such as `incidents/`, matches every queue that starts with it; any other `queue` matches exactly. A match has every label in `labels`.
@@ -165,7 +167,7 @@ The hub serves MCP itself at `/mcp`, over streamable HTTP, authenticated with th
 - **`claim` waits** at most 60 seconds, because MCP tool calls time out. An agent that needs to wait longer calls it again.
 - **`run` is CLI only.**
 
-**Errors** are JSON with a stable `code`, for example `claim_lost`, `task_claimed`, `nothing_ready`, `forbidden`, `invalid_transition`, `not_found`, `invalid_argument`, `request_id_reused`, or `store_locked` (another process owns the database). Each error says what the caller can do next. `max_attempts` is 1 to 100.
+**Errors** are JSON with a stable `code`, for example `claim_lost`, `task_claimed`, `nothing_ready`, `unauthorized`, `forbidden`, `invalid_transition`, `not_found`, `invalid_argument`, `request_id_reused`, or `store_locked` (another process owns the database). A missing or invalid agent key returns `401 unauthorized`; insufficient action or explicit queue scope returns `403 forbidden`. Each error says what the caller can do next. `max_attempts` is 1 to 100.
 
 ### v1 sources
 
@@ -179,7 +181,7 @@ Webhooks need a public HTTPS address. v1 documents running the hub behind a reve
 
 - **Sources.** Verify every source's signature and reject replays outside a short time window. Unverified requests create nothing.
 - **Who can create tasks.** Only verified sources and admin keys. Whoever creates tasks steers the agents.
-- **Agent keys.** Each key belongs to one agent, is limited to its queues and actions, is stored hashed, can be revoked, and is shown only once.
+- **Agent keys.** Each key belongs to one agent, is limited to its queues and actions, is stored hashed, can be revoked, and is shown only once. Until key management ships, `serve` loads `{ agent, sha256, queues, can }` entries from a JSON file at startup. Keys are 32 random bytes encoded as hex, with only the SHA-256 digest of that hex string in the file. Queue grants are exact names, slash-terminated prefixes, or `*` for every queue. Remove an entry and restart to revoke it; keep the agent name stable when rotating its key.
 - **Untrusted payloads.** Task titles and payloads come from outside. The API and MCP tools return them in fields marked untrusted, separate from fields the hub sets. Agents must not follow instructions found in them.
 - **Rate limits and audit.** Ingest is rate limited per source. The event log is append-only.
 - **Limit.** The hub can't make agents safe. A crafted alert is a path for prompt injection into agents that have production access. Whatever an agent's own credentials allow is the real security boundary.
