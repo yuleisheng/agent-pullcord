@@ -383,11 +383,8 @@ export class Store {
   task(id: number): Task & { memos: Record<string, unknown> } {
     return this.#run(() => {
       const row = this.#row(id)
-      const memos: Record<string, unknown> = {}
-      for (const memo of this.#db.prepare('SELECT key, value FROM memos WHERE task_id = ? ORDER BY key').all(id) as { key: string; value: string }[]) {
-        memos[memo.key] = JSON.parse(memo.value)
-      }
-      return { ...toTask(row), memos }
+      const memos = this.#db.prepare('SELECT key, value FROM memos WHERE task_id = ? ORDER BY key').all(id) as { key: string; value: string }[]
+      return { ...toTask(row), memos: Object.fromEntries(memos.map(({ key, value }) => [key, JSON.parse(value) as unknown])) }
     })
   }
 
