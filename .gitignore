@@ -1,3 +1,5 @@
 node_modules/
 *.db
 *.db-*
+pullcord-keys.json
+pullcord-sources.json

@@ -123,7 +123,8 @@ These are the expectations tests are written from. Change one only through a rev
 Agent endpoints take `Authorization: Bearer <key>`. Task JSON uses snake_case fields; timestamps are Unix milliseconds. Titles and payloads appear only inside `untrusted`.
 
 - **Ingest:**
-  - `POST /ingest/:source`: verifies the source's signature, maps the event to a task or a cancel, and answers `202`.
+  - `POST /ingest/:source`: verifies the configured source's signature on the exact request bytes; it does not use agent keys. A supported delivery may create or cancel a task. A duplicate, ignored event, or resolution with no matching active task also answers `202 {}`. Unknown sources return `404 not_found`; bad signatures or stale actionable events return `401 unauthorized`; malformed signed payloads return `400 invalid_argument`.
+  - The hub gets `name` (used as `:source` and the dedupe namespace), `provider`, `queue`, `secret`, and optional `retry` from each source entry. The producer cannot choose the queue or retry policy. `serve` loads the JSON array once from `pullcord-sources.json` or `--sources <path>`.
 - **Read** (requires the `read` action):
   - `GET /tasks?queue=&state=&label=`: returns `{ tasks }` with tasks in the key's queues. Only keys with the `*` queue grant and the `events` action also get `cursor`, the current global event cursor. An explicit `queue` must be within scope; a slash-terminated queue matches its descendants. Repeat `label=key=value` to require multiple labels.
   - `GET /tasks/:id`: returns one task with its `memos` object. Out-of-scope and missing IDs both return `404 not_found`.
@@ -173,19 +174,19 @@ The hub serves MCP itself at `/mcp`, over streamable HTTP, authenticated with th
 
 ### v1 sources
 
-- **PagerDuty:** a v3 webhook. `incident.triggered` creates a task. `incident.resolved` cancels it.
-- **GitHub:** issues and failed workflow runs.
-- **Generic:** JSON signed with HMAC, for any service that can send a webhook.
+- **PagerDuty:** a v3 webhook using the provider-issued secret and `X-PagerDuty-Signature: v1=<hex>`. `incident.triggered` creates a task keyed by incident ID. `incident.resolved` cancels that task from the same configured source; repeated resolutions do not append another event. A resolution before any trigger does not create a task or a tombstone. Freshness comes from signed `event.occurred_at`.
+- **GitHub:** JSON webhooks with `X-Hub-Signature-256: sha256=<hex>`. Only `issues/opened` and failed `workflow_run/completed` create tasks (one per issue ID or workflow run ID, respectively). Freshness comes from the signed issue's `created_at` or run's `updated_at`, not the unsigned delivery ID. Authenticated notifications without a supported action, including ping, do not change any task.
+- **Generic:** `X-Pullcord-Signature: sha256=<hex>` contains the HMAC-SHA256 of the raw JSON bytes with the configured secret as UTF-8. The JSON object contains `timestamp` (integer Unix milliseconds), `dedupe_key`, and `title`.
 
 Webhooks need a public HTTPS address. v1 documents running the hub behind a reverse proxy or a tunnel. Polling adapters, for sources without webhooks or a hub without public ingress, come after v1.
 
 ## Security
 
-- **Sources.** Verify every source's signature and reject replays outside a short time window. Unverified requests create nothing.
+- **Sources.** Verify every source's signature and require actionable deliveries to have a signed timestamp within five minutes of the hub clock, even on legitimate late retries. Unverified requests create and cancel nothing.
 - **Who can create tasks.** Only verified sources and admin keys. Whoever creates tasks steers the agents.
 - **Agent keys.** Each key belongs to one agent, is limited to its queues and actions, is stored hashed, can be revoked, and is shown only once. Until key management ships, `serve` loads `{ agent, sha256, queues, can }` entries from a JSON file at startup. Keys are 32 random bytes encoded as hex, with only the SHA-256 digest of that hex string in the file. Queue grants are exact names, slash-terminated prefixes, or `*` for every queue. Removing an entry revokes its key only after `serve` restarts. Keep the agent name stable when rotating its key.
 - **Untrusted payloads.** Task titles and payloads come from outside. The API and MCP tools return them in fields marked untrusted, separate from fields the hub sets. Agents must not follow instructions found in them.
-- **Rate limits and audit.** Ingest is rate limited per source. The event log is append-only.
+- **Rate limits and audit.** An ingest body is limited to 1 MiB. Each configured source may send 120 verified deliveries per minute in a process-local window; further deliveries receive `429 rate_limited`. The event log is append-only.
 - **Limit.** The hub can't make agents safe. A crafted alert is a path for prompt injection into agents that have production access. Whatever an agent's own credentials allow is the real security boundary.
 
 ## Acceptance checks

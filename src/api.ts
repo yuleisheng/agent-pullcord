@@ -1,13 +1,17 @@
-import { HOLDER_ACTIONS, parseKeyConfig, type Action } from './config.ts'
+import { HOLDER_ACTIONS, parseKeyConfig, parseSourceConfig, type Action } from './config.ts'
+import { readSourceEvent, SourceError } from './sources/index.ts'
 import { MAX_LEASE_MS, MIN_LEASE_MS, StoreError, type ErrorCode } from './store-contract.ts'
 import type { Labels, Store, Task, TaskEvent, TaskState, Writer } from './store.ts'
 
-type TaskStore = Pick<Store, 'tasks' | 'task' | 'taskQueue' | 'events' | 'claim' | 'renew' | 'complete' | 'fail' | 'release' | 'block' | 'log' | 'memo' | 'unblock' | 'requeue' | 'cancel'>
+type TaskStore = Pick<Store, 'tasks' | 'task' | 'taskQueue' | 'events' | 'claim' | 'renew' | 'complete' | 'fail' | 'release' | 'block' | 'log' | 'memo' | 'unblock' | 'requeue' | 'cancel' | 'ingest' | 'cancelFromSource'>
 
 type HolderAction = (typeof HOLDER_ACTIONS)[number]
 type OtherWrite = 'log' | 'memo' | 'unblock' | 'requeue' | 'cancel'
 
 const MAX_BODY_BYTES = 64 * 1024
+const MAX_INGEST_BYTES = 1024 * 1024
+const INGEST_WINDOW_MS = 60_000
+const INGEST_WINDOW_LIMIT = 120
 const MAX_WAIT_SECONDS = 30
 const POLL_MS = 250
 
@@ -116,31 +120,46 @@ function leaseMs(value: unknown): number | undefined {
   return ms
 }
 
-async function jsonBody(request: Request): Promise<Record<string, unknown>> {
-  if (request.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() !== 'application/json') {
-    throw new ApiError(415, 'invalid_argument', 'Send Content-Type: application/json.')
-  }
+async function readBody(request: Request, limit: number): Promise<Uint8Array<ArrayBuffer>> {
+  const tooLarge = () => new ApiError(413, 'invalid_argument', `Keep the request body within ${limit / 1024} KiB.`)
+  if (Number(request.headers.get('content-length')) > limit) throw tooLarge()
   const reader = request.body?.getReader()
-  if (!reader) invalid('Send a JSON object in the request body.')
-  const decoder = new TextDecoder('utf-8', { fatal: true })
+  if (!reader) return new Uint8Array(0)
+  const chunks: Uint8Array[] = []
   let bytes = 0
-  let text = ''
   try {
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
       bytes += value.byteLength
-      if (bytes > MAX_BODY_BYTES) throw new ApiError(413, 'invalid_argument', 'Keep the JSON request body within 64 KiB.')
-      text += decoder.decode(value, { stream: true })
+      if (bytes > limit) throw tooLarge()
+      chunks.push(value)
     }
-    const body: unknown = JSON.parse(text + decoder.decode())
-    if (isObject(body)) return body
-  } catch (error) {
-    if (error instanceof ApiError) throw error
   } finally {
     reader.releaseLock()
   }
-  invalid('Send a valid UTF-8 JSON object in the request body.')
+  const raw = new Uint8Array(bytes)
+  let offset = 0
+  for (const chunk of chunks) {
+    raw.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return raw
+}
+
+async function jsonBody(request: Request): Promise<Record<string, unknown>> {
+  if (request.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() !== 'application/json') {
+    throw new ApiError(415, 'invalid_argument', 'Send Content-Type: application/json.')
+  }
+  const raw = await readBody(request, MAX_BODY_BYTES)
+  let body: unknown
+  try {
+    body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw))
+  } catch {
+    invalid('Send a valid UTF-8 JSON object in the request body.')
+  }
+  if (!isObject(body)) invalid('Send a JSON object in the request body.')
+  return body
 }
 
 function listFilter(query: URLSearchParams): { queue?: string; state?: TaskState; labels?: Labels } {
@@ -307,18 +326,46 @@ async function otherWrite(store: TaskStore, agent: Agent, action: OtherWrite, pa
   }
 }
 
-function json(body: unknown, status = 200): Response {
+function json(body: unknown, status = 200, bearerChallenge = status === 401): Response {
   const headers = new Headers({ 'Cache-Control': 'no-store' })
-  if (status === 401) headers.set('WWW-Authenticate', 'Bearer')
+  if (bearerChallenge) headers.set('WWW-Authenticate', 'Bearer')
   return Response.json(body, { status, headers })
 }
 
-export function createApi(store: TaskStore, config: unknown): (request: Request) => Promise<Response> {
+function createIngest(store: TaskStore, config: unknown) {
+  const sources = new Map(parseSourceConfig(config).map((source) => [source.name, { ...source, used: 0, until: 0 }]))
+  return async (request: Request, name: string) => {
+    const source = sources.get(name)
+    if (!source) throw new ApiError(404, 'not_found', 'Use the webhook URL for a configured source.')
+    const raw = await readBody(request, MAX_INGEST_BYTES)
+    const event = await readSourceEvent(source.provider, source.secret, request.headers, raw, Date.now())
+    request.signal.throwIfAborted()
+    const time = performance.now()
+    if (time >= source.until) {
+      source.until = time + INGEST_WINDOW_MS
+      source.used = 0
+    }
+    if (source.used >= INGEST_WINDOW_LIMIT) throw new ApiError(429, 'rate_limited', 'This source reached its delivery limit. Retry in a minute.')
+    source.used++
+    const actor = `source:${name}`
+    if (event.action === 'create') {
+      store.ingest({ ...event.task, source: name, queue: source.queue, retry: source.retry }, { actor })
+    } else if (event.action === 'cancel') {
+      store.cancelFromSource(name, event.dedupeKey, { actor, reason: event.reason, requestId: event.requestId })
+    }
+    return json({}, 202)
+  }
+}
+
+export function createApi(store: TaskStore, config: unknown, sources: unknown = []): (request: Request) => Promise<Response> {
   const keys = keyring(config)
+  const ingest = createIngest(store, sources)
   return async (request) => {
     try {
-      const agent = await authenticate(request, keys)
       const { pathname, searchParams } = new URL(request.url)
+      const webhook = /^\/ingest\/([^/]+)$/.exec(pathname)
+      if (request.method === 'POST' && webhook) return await ingest(request, webhook[1])
+      const agent = await authenticate(request, keys)
       const task = /^\/tasks\/([^/]+)$/.exec(pathname)
       if (request.method === 'GET' && pathname === '/tasks') {
         requireAction(agent, 'read')
@@ -352,6 +399,7 @@ export function createApi(store: TaskStore, config: unknown): (request: Request)
       }
       throw new ApiError(404, 'not_found', 'Use a supported API endpoint.')
     } catch (error) {
+      if (error instanceof SourceError) return json({ code: error.code, message: error.message }, error.status, false)
       if (error instanceof ApiError || error instanceof StoreError) {
         const status = error instanceof ApiError ? error.status : STORE_STATUS[error.code]
         return json({ code: error.code, message: error.message }, status)
