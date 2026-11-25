@@ -1,4 +1,6 @@
 node_modules/
+dist/
+agent-pullcord-*.tgz
 *.db
 *.db-*
 pullcord-keys.json

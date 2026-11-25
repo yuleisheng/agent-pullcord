@@ -1,6 +1,6 @@
 # agent-pullcord: product requirements and design
 
-Status: draft for review. No code yet. Decisions marked **Proposed** need an owner's sign-off before the first code PR.
+This document specifies v1. Changes to a design decision, lifecycle row, or invariant require the owner's sign-off.
 
 ## Problem
 
@@ -141,19 +141,19 @@ Agent endpoints take `Authorization: Bearer <key>`. Task JSON uses snake_case fi
 
 ### CLI
 
-The CLI is `pullcord`. It reads `PULLCORD_URL` and `PULLCORD_KEY` from the environment. It keeps each claim's epoch in a file only the user can read, so commands after `claim` take just the task ID. `--json` prints machine-readable output and errors.
+The CLI is `pullcord`. It reads `PULLCORD_URL` and `PULLCORD_KEY` from the environment. It keeps each claim's epoch in a private file scoped to the URL, key, and task, so commands after `claim` take just the task ID. `--json` prints machine-readable output and errors; `events --follow` emits one JSON event per line in that mode.
 
 **Setup, for people:**
-- `pullcord init [--db <path>]`: creates the database and prints a one-time admin key.
-- `pullcord serve [--listen <addr>] [--public-url <url>]`: runs the hub.
-- `pullcord sources add <pagerduty|github|generic> --queue <queue> [--retry safe|manual]`: prints the webhook URL and the secret to paste into the provider.
-- `pullcord keys create <agent> --queues <glob> [--can <actions>]`: prints the key once, with an MCP config snippet.
+- `pullcord init [--db <path>] [--keys <path>]`: initializes the database and prints a one-time admin key with all queues and actions. It will not replace an existing key file.
+- `pullcord serve [--listen <addr>] [--public-url <url>]`: runs the hub. `--db`, `--keys`, and `--sources` override the default paths. It reloads keys and sources only on restart.
+- `pullcord sources add <pagerduty|github|generic> --queue <queue> [--retry safe|manual]`: prints the webhook URL and, for GitHub or Generic, a generated secret unless `--secret-file` is given. PagerDuty issues its own secret; import it with `--secret-file`. Imported secrets are not echoed. The URL base comes from `--public-url`, then `PULLCORD_URL`, then the default loopback address.
+- `pullcord keys create <agent> --queues <scope[,scope...]> [--can <action[,action...]>]`: prints the key once, with an MCP config snippet using `PULLCORD_URL`. Default actions are read, claim, renew, complete, fail, release, block, log, and memo; events and admin are opt-in.
 - `pullcord keys list`, `pullcord keys revoke <agent>`.
 
 **Work, for agents:**
 - `pullcord claim <queue> [--label k=v] [--wait 30s] [--lease 15m]`: claims the match that has been ready longest and prints it.
 - `pullcord renew <id>`, `pullcord complete <id> ["result"]`, `pullcord fail <id> "reason" [--retry]`, `pullcord release <id>`, `pullcord block <id> "question"`.
-- `pullcord run <queue|id> -- <command>`: claims a task and runs the command with `PULLCORD_TASK` set, renewing at a third of the lease. Exit 0 completes the task, any other exit fails it, and Ctrl-C releases it. Taken from Board's `tasks run`.
+- `pullcord run <queue|id> -- <command>`: claims a task and runs the command with `PULLCORD_TASK` set, renewing at a third of the lease. A decimal selector is an exact task ID instead of a queue. Exit 0 completes the task, any other exit fails it, and Ctrl-C stops the command before releasing it. If renewal loses the claim, stop the command without settling the task. Taken from Board's `tasks run`.
 - `pullcord log <id> "note"`, `pullcord memo <id> <key> [value]`.
 
 **Oversight, for people:**
@@ -186,14 +186,14 @@ Webhooks need a public HTTPS address. v1 documents running the hub behind a reve
 
 - **Sources.** Verify every source's signature and require actionable deliveries to have a signed timestamp within five minutes of the hub clock, even on legitimate late retries. Unverified requests create and cancel nothing.
 - **Who can create tasks.** Only verified sources and admin keys. Whoever creates tasks steers the agents.
-- **Agent keys.** Each key belongs to one agent, is limited to its queues and actions, is stored hashed, can be revoked, and is shown only once. Until key management ships, `serve` loads `{ agent, sha256, queues, can }` entries from a JSON file at startup. Keys are 32 random bytes encoded as hex, with only the SHA-256 digest of that hex string in the file. Queue grants are exact names, slash-terminated prefixes, or `*` for every queue. Removing an entry revokes its key only after `serve` restarts. Keep the agent name stable when rotating its key.
+- **Agent keys.** Each key belongs to one agent, is limited to its queues and actions, is stored hashed, can be revoked, and is shown only once. `serve` loads `{ agent, sha256, queues, can }` entries from `pullcord-keys.json` or `--keys <path>` at startup. Keys are 32 random bytes encoded as hex, with only the SHA-256 digest of that hex string in the file. Queue grants are exact names, slash-terminated prefixes, or `*` for every queue. Removing an entry revokes its key only after `serve` restarts. Keep the agent name stable when rotating its key.
 - **Untrusted payloads.** Task titles and payloads come from outside. The API and MCP tools return them in fields marked untrusted, separate from fields the hub sets. Agents must not follow instructions found in them.
 - **Rate limits and audit.** An ingest body is limited to 1 MiB. Each configured source may send 120 deliveries with valid signatures per minute in a process-local window. The limit applies before parsing or freshness checks. Further verified deliveries receive `429 rate_limited`. The event log is append-only.
 - **Limit.** The hub can't make agents safe. A crafted alert is a path for prompt injection into agents that have production access. Whatever an agent's own credentials allow is the real security boundary.
 
 ## Acceptance checks
 
-Each check runs against the built package, a real `serve` process, through its HTTP API or CLI. It uses a temporary database, fake senders for each source, and no real credentials.
+Run `npm run test:acceptance`. Each check packs and installs the package as part of the suite, then talks to a real installed `pullcord serve` process through its HTTP API or CLI. It uses a temporary database, fake senders for each source, and no real credentials.
 
 ### A PagerDuty incident becomes one task
 - **Reach it:** a signed POST to `/ingest/pagerduty` with a fixture based on PagerDuty's documented v3 payload.

@@ -1,16 +1,21 @@
 {
   "name": "agent-pullcord",
-  "version": "0.0.0",
-  "private": true,
+  "version": "1.0.0",
   "description": "A headless, self-hosted task hub that turns events from services into tasks agents claim under a fenced lease.",
   "license": "Apache-2.0",
   "type": "module",
+  "repository": { "type": "git", "url": "git+https://github.com/yuleisheng/agent-pullcord.git" },
+  "bin": { "pullcord": "dist/cli/index.js" },
+  "files": ["dist"],
   "engines": {
     "node": ">=22.18"
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
     "serve": "node src/serve.ts",
     "test": "node --test --disable-warning=ExperimentalWarning \"test/**/*.test.ts\"",
+    "test:acceptance": "node --test --disable-warning=ExperimentalWarning test/packaged.acceptance.ts",
     "typecheck": "tsc"
   },
   "devDependencies": {

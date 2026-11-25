@@ -1,33 +1,67 @@
 # agent-pullcord
 
-A small, headless, self-hosted service between event sources and coding agents. It turns events from services such as PagerDuty and GitHub into tasks. Any agent can claim a task under a fenced lease, work it, and settle it, so two agents never act on the same event.
+A headless, self-hosted hub that turns signed webhooks into tasks for coding agents. Agents can work over HTTP, Streamable HTTP MCP, or the `pullcord` CLI. The hub accepts claim-scoped writes only from the current lease holder.
 
-Status: early. The server supports signed source webhooks, task reads and writes, event watching, and Streamable HTTP MCP at `/mcp`. The agent CLI isn't implemented yet. See [docs/PRD.md](docs/PRD.md) for the design.
+## Install from a checkout
 
-## Run the HTTP server locally
-
-Use Node 22.18 or later. Generate a key for a local agent and put only its digest in the server's configuration:
+Use Node 22.18 or later. The first npm release is not yet published. In the source checkout, build and install the same tarball used by the acceptance checks:
 
 ```sh
-umask 077
-export PULLCORD_KEY="$(node -p "require('node:crypto').randomBytes(32).toString('hex')")"
-node -e '
-  const sha256 = require("node:crypto").createHash("sha256").update(process.env.PULLCORD_KEY).digest("hex")
-  console.log(JSON.stringify([{ agent: "local-agent", sha256, queues: ["incidents/"], can: ["read", "claim", "complete"] }]))
-' > pullcord-keys.json
-env -u PULLCORD_KEY npm run serve -- --keys pullcord-keys.json --db pullcord.db
+npm ci
+npm pack
+npm install --global ./agent-pullcord-1.0.0.tgz
 ```
 
-From a shell with that same key, list tasks:
+## Claim your first task without a provider account
+
+From a new working directory:
 
 ```sh
-printf 'Authorization: Bearer %s\n' "$PULLCORD_KEY" | curl --fail-with-body -H @- http://127.0.0.1:7337/tasks
+pullcord init
+pullcord keys create demo-agent --queues demo/
+pullcord sources add generic --queue demo/local
+pullcord serve
 ```
 
-A new database returns an empty list. Use an existing task-store database to read populated tasks. The global event cursor appears only for keys with both `"*"` queue access and the `events` action, in addition to `read`. Save that cursor and call `GET /events?after=<cursor>&wait=30` with an all-queue `events` key to follow changes.
+Save the admin key separately. For this demo, use the **demo-agent key** and the **Generic signing secret**, not the admin key. Both are printed when created, not by `keys list`. The hub stores only key digests; the source file contains live signing secrets and should stay owner-readable only.
 
-The server listens on loopback by default; use TLS at a reverse proxy before exposing it outside the machine. Keys are loaded at startup. To revoke a key, remove its entry from the file and restart the server.
+In another Bash shell on the same machine, send a signed fixture and claim it:
 
-To connect a source, save a JSON array of `{name, provider, queue, secret, retry?}` entries in `pullcord-sources.json` or pass `--sources <path>` to `serve`. Keep the file owner-readable only; it contains live signing secrets. Restart after edits. Send JSON to `/ingest/<name>` at your public HTTPS address. The [PRD](docs/PRD.md#v1-sources) specifies each signature header, payload, and the five-minute freshness window. Use the secret [provided by PagerDuty](https://docs.pagerduty.com/developer/verifying-webhook-signatures) for its v3 webhook; for [GitHub](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries), choose a separate webhook secret and subscribe to issue and workflow run events.
+```sh
+read -rsp 'Demo agent key: ' PULLCORD_KEY; printf '\n'
+read -rsp 'Generic signing secret: ' DEMO_SOURCE_SECRET; printf '\n'
+export PULLCORD_KEY DEMO_SOURCE_SECRET
+export PULLCORD_URL=http://127.0.0.1:7337
 
-Claim with `POST /tasks/claim` and `{"queue":"incidents/demo","request_id":"demo-claim-1"}` as JSON. To finish, use `POST /tasks/:id/complete` with the returned task's `id` in the URL and its `epoch` in the JSON body, alongside a new `request_id`. Reuse the same request ID when retrying the same write.
+node --input-type=module <<'JS'
+import { createHmac } from 'node:crypto'
+const body = JSON.stringify({ timestamp: Date.now(), dedupe_key: 'demo-1', title: 'Verify the demo' })
+const signature = createHmac('sha256', process.env.DEMO_SOURCE_SECRET).update(body).digest('hex')
+const response = await fetch(`${process.env.PULLCORD_URL}/ingest/generic`, {
+  method: 'POST', body,
+  headers: { 'Content-Type': 'application/json', 'X-Pullcord-Signature': `sha256=${signature}` },
+})
+if (response.status !== 202) throw new Error(`Webhook rejected (${response.status}): ${await response.text()}`)
+JS
+unset DEMO_SOURCE_SECRET
+
+pullcord --json claim demo/local
+pullcord complete 1 'Demo verified'
+```
+
+Use the returned task ID instead of `1` if you started with an existing database. `pullcord --help` lists the commands. `pullcord run <queue|id> -- <command>` leases and runs a command locally; a decimal selector is an exact task ID. If renewal loses the claim, `run` stops the command and does not settle the task.
+
+## Connect a source or an agent
+
+- Put the hub behind an HTTPS reverse proxy or tunnel before exposing it outside its host. It listens on loopback by default. Pass `pullcord serve --public-url https://hub.example.com` and use the same base in `PULLCORD_URL` when printing source URLs or MCP snippets. A proxy base with a path prefix must strip that prefix upstream. Forward the original body, signature and authorization headers, and MCP session/version headers; allow at least 30 seconds for long-polling requests.
+- For [GitHub](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries), run `pullcord sources add github --queue incidents/ci`. Use the printed URL and secret in a JSON webhook subscribed to issues or workflow runs. For [PagerDuty](https://docs.pagerduty.com/developer/verifying-webhook-signatures), create a v3 subscription to `/ingest/pagerduty` for triggered and resolved incidents, then run `pullcord sources add pagerduty --queue incidents/on-call --secret-file <path>` with its provider-issued secret. Protect and remove the temporary secret file after import. The [source contracts](docs/PRD.md#v1-sources) specify exactly which events create work and the five-minute freshness limit, which also rejects late provider retries.
+- Give each agent its own scoped key. For a Streamable HTTP MCP client, use the URL and bearer header from `pullcord keys create`. For the CLI, set `PULLCORD_URL` and `PULLCORD_KEY`. Restart `serve` after adding a source, issuing a key, or revoking one with `pullcord keys revoke <agent>`. Use `--db`, `--keys`, and `--sources` to select paths other than the default `pullcord.db`, `pullcord-keys.json`, and `pullcord-sources.json`.
+- For a watcher, use a key with the `*` queue grant and `events` (plus `read` for a task snapshot). Save the cursor and reconnect with `pullcord --json events --after <cursor> --follow` for one JSON event per line. The [HTTP API](docs/PRD.md#api-v1) exposes the same operations and cursor.
+
+## Checks
+
+```sh
+npm run typecheck && npm test && npm run test:acceptance
+```
+
+The acceptance suite installs the tarball offline and runs the installed `pullcord serve` against temporary databases and fake webhook senders. It does not publish the package.
