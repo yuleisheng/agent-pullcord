@@ -340,7 +340,15 @@ export class Store {
       if (TERMINAL.has(row.state)) {
         throw new StoreError('invalid_transition', `Task ${id} is already ${row.state}. Finished tasks can't be canceled.`)
       }
-      return toTask(this.#moveAndClearClaim(row, 'task.canceled', 'canceled', who, now, { reason: who.reason }))
+      return this.#cancel(row, who, now)
+    })
+  }
+
+  cancelFromSource(source: string, dedupeKey: string, who: Writer & { reason: string }): void {
+    need(isName(who.reason), 'reason must be a non-empty string')
+    this.#write('source.cancel', null, { source, dedupeKey, reason: who.reason }, who, (now) => {
+      const row = this.#get('SELECT * FROM tasks WHERE source = ? AND dedupe_key = ?', source, dedupeKey)
+      return row && !TERMINAL.has(row.state) ? this.#cancel(row, who, now) : null
     })
   }
 
@@ -474,6 +482,10 @@ export class Store {
     const row = this.#row(id)
     if (row.state !== from) throw new StoreError('invalid_transition', `Task ${id} is ${row.state}, not ${from}.`)
     return this.#move(row, type, 'ready', who, now, { reason: null, ...set(row) })
+  }
+
+  #cancel(row: Row, who: Writer & { reason: string }, now: number): Task {
+    return toTask(this.#moveAndClearClaim(row, 'task.canceled', 'canceled', who, now, { reason: who.reason }))
   }
 
   #moveAndClearClaim(row: Row, type: string, to: TaskState, who: Writer, now: number, set: Partial<Row>, data?: unknown): Row {

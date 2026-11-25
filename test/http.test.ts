@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, createHmac } from 'node:crypto'
 import { once } from 'node:events'
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -76,9 +76,10 @@ function client(origin: string) {
   }
 }
 
-async function start(db: string, keys: string, clock?: number) {
+async function start(db: string, keys: string, clock?: number, sources?: string) {
   const flags = clock === undefined ? [] : ['--import', `data:text/javascript,Date.now=()=>${clock}`]
-  const child = spawn(process.execPath, [...flags, ...args(db, keys)], { stdio: ['ignore', 'pipe', 'pipe'] })
+  const sourceFlags = sources === undefined ? [] : ['--sources', sources]
+  const child = spawn(process.execPath, [...flags, ...args(db, keys), ...sourceFlags], { stdio: ['ignore', 'pipe', 'pipe'] })
   const done = once(child, 'close')
   let stderr = ''
   child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk })
@@ -302,7 +303,7 @@ test('one of 20 HTTP claims wins and its receipt and event survive an abrupt ser
   })
 })
 
-async function workingHub(t: TestContext, name: string) {
+async function workingHub(t: TestContext, name: string, sources: unknown = []) {
   let clock = now
   let onAccess: (() => void) | undefined
   const store = openStore({ path: join(dir, `${name}.db`), clock: () => {
@@ -319,7 +320,7 @@ async function workingHub(t: TestContext, name: string) {
     credential('events-only', blind, ['*'], ['events']),
     credential('no-events', allReader, ['*'], ['read']),
     credential('operator', unknownKey, [checkoutQueue], ['admin']),
-  ])
+  ], sources)
   t.after(async () => {
     const closed = once(server, 'close')
     server.close()
@@ -587,4 +588,98 @@ test('HTTP notes, memos and admin writes enforce their own scopes and survive re
     'task.logged', 'task.memo', 'task.claimed', 'task.blocked', 'task.unblocked', 'task.claimed',
     'task.lease_expired', 'task.requeued', 'task.claimed', 'task.canceled',
   ])
+})
+
+const primarySecret = 'fixture primary secret'
+const secondarySecret = 'fixture secondary secret'
+
+function pagerDutyDelivery(hub: ReturnType<typeof client>, source: string, type: 'triggered' | 'resolved', secret: string, at = now) {
+  const body = JSON.stringify({ event: {
+    id: `delivery-${type}`, event_type: `incident.${type}`, occurred_at: new Date(at).toISOString(),
+    data: { id: 'PGR0VU2', title: 'Source title', queue: 'producer-queue', retry: 'manual' },
+  } }, null, 2)
+  return hub.request(`/ingest/${source}`, undefined, {
+    method: 'POST', body, headers: { 'X-PagerDuty-Signature': `v1=${createHmac('sha256', secret).update(body).digest('hex')}` },
+  })
+}
+
+test('signed webhook retries survive restart and resolution fences only the matching source task', { timeout: 15_000 }, async (t) => {
+  const db = join(dir, 'ingest.db')
+  const keys = join(dir, 'ingest-keys.json')
+  const sources = join(dir, 'ingest-sources.json')
+  writeFileSync(keys, JSON.stringify([
+    credential('watcher', watcher, ['*'], ['read', 'events']),
+    credential('a', agentA, [checkoutQueue], ['claim', 'complete']),
+  ]))
+  writeFileSync(sources, JSON.stringify([
+    { name: 'pagerduty', provider: 'pagerduty', queue: checkoutQueue, retry: 'safe', secret: primarySecret },
+    { name: 'secondary', provider: 'pagerduty', queue: 'elsewhere', secret: secondarySecret },
+  ]), { mode: 0o600 })
+
+  const server = await start(db, keys, now, sources)
+  t.after(() => server.stop())
+  await error(await server.post('/ingest/pagerduty', watcher, {}), 401, 'unauthorized')
+  await error(await pagerDutyDelivery(server, 'pagerduty', 'triggered', primarySecret, now - 300_001), 401, 'unauthorized')
+  assert.equal((await pagerDutyDelivery(server, 'secondary', 'resolved', secondarySecret)).status, 202)
+  assert.deepEqual(await ok(await server.get('/events', watcher)), { events: [], cursor: 0 })
+  const sent = await Promise.all(Array.from({ length: 3 }, () => pagerDutyDelivery(server, 'pagerduty', 'triggered', primarySecret)))
+  for (const response of sent) {
+    assert.equal(response.status, 202)
+    assert.deepEqual(await response.json(), {})
+  }
+  const { tasks: [task], cursor } = await ok(await server.get('/tasks', watcher))
+  assert.equal(cursor, 1)
+  assert.deepEqual([task.queue, task.retry, task.state, task.dedupe_key, task.untrusted.title], [checkoutQueue, 'safe', 'ready', 'PGR0VU2', 'Source title'])
+  assert.equal(await server.stop('SIGKILL'), 'SIGKILL')
+
+  const restarted = await start(db, keys, now, sources)
+  t.after(() => restarted.stop())
+  assert.equal((await pagerDutyDelivery(restarted, 'pagerduty', 'triggered', primarySecret)).status, 202)
+  assert.equal((await pagerDutyDelivery(restarted, 'secondary', 'triggered', secondarySecret)).status, 202)
+  const claim = await ok(await restarted.post(claimPath, agentA, { id: task.id, request_id: 'held' }))
+  await error(await pagerDutyDelivery(restarted, 'pagerduty', 'resolved', secondarySecret), 401, 'unauthorized')
+  const canceled = await Promise.all(Array.from({ length: 3 }, () => pagerDutyDelivery(restarted, 'pagerduty', 'resolved', primarySecret)))
+  for (const response of canceled) assert.equal(response.status, 202)
+  await error(await restarted.post(`/tasks/${task.id}/complete`, agentA, { request_id: 'stale', epoch: claim.epoch }), 409, 'claim_lost')
+  const snapshot = await ok(await restarted.get('/tasks', watcher))
+  assert.deepEqual(snapshot.tasks.map(({ state }: { state: string }) => state), ['canceled', 'ready'])
+  const { events } = await ok(await restarted.get('/events?after=1', watcher))
+  assert.deepEqual(events.map(({ type, actor, request_id }: { type: string; actor: string; request_id: string }) => [type, actor, request_id]), [
+    ['task.created', 'source:secondary', null], ['task.claimed', 'agent:a', 'held'], ['task.canceled', 'source:pagerduty', 'delivery-resolved'],
+  ])
+})
+
+test('ingest bounds chunked bodies and rate-limits verified deliveries per configured name', { timeout: 10_000 }, async (t) => {
+  const hub = await workingHub(t, 'ingest-limit', [
+    { name: 'generic', provider: 'generic', queue: checkoutQueue, secret: primarySecret },
+    { name: 'second', provider: 'generic', queue: 'elsewhere', secret: secondarySecret },
+  ])
+  const bytes = new Uint8Array(512 * 1024)
+  const chunked: RequestInit & { duplex: 'half' } = { method: 'POST', duplex: 'half', body: new ReadableStream({ start(controller) {
+    controller.enqueue(bytes)
+    controller.enqueue(bytes)
+    controller.enqueue(Uint8Array.of(32))
+    controller.close()
+  } }) }
+  await error(await hub.request('/ingest/generic', undefined, chunked), 413, 'invalid_argument')
+  await error(await hub.post('/ingest/unknown', watcher, {}), 404, 'not_found')
+  await error(await hub.post('/ingest/generic', watcher, {}), 401, 'unauthorized')
+
+  const send = (source: string, secret: string, dedupe_key = 'limit-test') => {
+    const body = JSON.stringify({ timestamp: Date.now(), dedupe_key, title: 'Fixture' })
+    return hub.request(`/ingest/${source}`, undefined, {
+      method: 'POST', body, headers: { 'X-Pullcord-Signature': `sha256=${createHmac('sha256', secret).update(body).digest('hex')}` },
+    })
+  }
+  for (let i = 0; i < 120; i++) {
+    const response = await send('generic', primarySecret)
+    assert.equal(response.status, 202, `delivery ${i + 1}`)
+    await response.text()
+  }
+  await error(await send('generic', primarySecret, 'would-be-new'), 429, 'rate_limited')
+  assert.equal((await send('second', secondarySecret)).status, 202)
+  const { tasks, cursor } = await ok(await hub.get('/tasks', watcher))
+  assert.equal(cursor, 2)
+  assert.deepEqual(tasks.map(({ source, dedupe_key }: { source: string; dedupe_key: string }) => [source, dedupe_key]),
+    [['generic', 'limit-test'], ['second', 'limit-test']])
 })
