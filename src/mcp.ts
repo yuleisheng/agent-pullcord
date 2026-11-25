@@ -1,13 +1,14 @@
 import { HOLDER_ACTIONS } from './config.ts'
 import { MAX_LEASE_MS, MIN_LEASE_MS } from './store-contract.ts'
 
-const VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26']
+const VERSIONS = ['2025-11-25', '2025-06-18']
 const SESSION_ID = 'MCP-Session-Id'
 const SESSION_IDLE_MS = 60 * 60 * 1000
 const CACHE_HEADERS = { 'Cache-Control': 'no-store' }
 const word = { type: 'string', minLength: 1 }
 const text = { type: 'string' }
 const id = { type: 'integer', minimum: 1 }
+const epoch = { ...id, description: 'Epoch returned by the claim for this attempt.' }
 const lease = { type: 'integer', minimum: MIN_LEASE_MS / 1000, maximum: MAX_LEASE_MS / 1000, description: 'Lease in seconds.' }
 const labels = { type: 'object', additionalProperties: text }
 const request_id = { ...word, description: 'Optional idempotency key. Reuse it only when retrying the same write.' }
@@ -22,13 +23,13 @@ const tools = [
   tool('claim', 'Claim the oldest ready task in a queue. Wait defaults to zero; call again to keep waiting.', {
     queue: word, labels, wait: { type: 'integer', minimum: 0, maximum: 30, description: 'Seconds to wait for work.' }, lease, request_id,
   }, ['queue']),
-  tool('renew', 'Extend the lease on a task claimed in this session.', { id, lease, request_id }, ['id']),
-  tool('complete', 'Finish a task claimed in this session, optionally recording a result.', { id, result: text, request_id }, ['id']),
+  tool('renew', 'Extend the lease on a task claimed in this session.', { id, epoch, lease, request_id }, ['id', 'epoch']),
+  tool('complete', 'Finish a task claimed in this session, optionally recording a result.', { id, epoch, result: text, request_id }, ['id', 'epoch']),
   tool('fail', 'Record why a task failed. Set retry to true to request another attempt if available.', {
-    id, reason: word, retry: { type: 'boolean' }, request_id,
-  }, ['id', 'reason']),
-  tool('release', 'Give back a task claimed in this session without spending an attempt.', { id, request_id }, ['id']),
-  tool('block', 'Give back a task and record what needs a human decision before work can resume.', { id, reason: word, request_id }, ['id', 'reason']),
+    id, epoch, reason: word, retry: { type: 'boolean' }, request_id,
+  }, ['id', 'epoch', 'reason']),
+  tool('release', 'Give back a task claimed in this session without spending an attempt.', { id, epoch, request_id }, ['id', 'epoch']),
+  tool('block', 'Give back a task and record what needs a human decision before work can resume.', { id, epoch, reason: word, request_id }, ['id', 'epoch', 'reason']),
   tool('log', 'Append a note to a task without changing its state.', { id, text: word, request_id }, ['id', 'text']),
   tool('memo', 'Read a memo by omitting value, or write a JSON value. The first write wins.', { id, key: word, value: {}, request_id }, ['id', 'key']),
 ]
@@ -38,7 +39,7 @@ interface Session {
   version: string
   initialized: boolean
   lastUsed: number
-  epochs: Map<number, number>
+  claims: Set<string>
 }
 
 type Fetch = (request: Request) => Promise<Response>
@@ -58,28 +59,38 @@ function rpcResult(id: RpcId, result: object, sessionId?: string): Response {
   return Response.json({ jsonrpc: '2.0', id, result }, { headers })
 }
 
-function toolResult(session: Session, data: unknown, isError = false) {
+function toolResult(data: unknown, isError = false) {
   return {
     content: [{ type: 'text', text: JSON.stringify(data) }],
-    ...(session.version === '2025-03-26' ? {} : { structuredContent: data }),
+    structuredContent: data,
     isError,
   }
 }
 
-function invalidTool(session: Session, message: string) {
-  return toolResult(session, { code: 'invalid_argument', message }, true)
+function invalidTool(message: string) {
+  return toolResult({ code: 'invalid_argument', message }, true)
 }
 
 async function callTool(request: Request, send: Fetch, session: Session, name: string, args: Record<string, unknown>) {
-  const dispatch = (path: string, body?: Record<string, unknown>) => send(new Request(new URL(path, request.url), {
-    method: body ? 'POST' : 'GET',
-    headers: { Authorization: request.headers.get('Authorization')!, ...(body && { 'Content-Type': 'application/json' }) },
-    body: body && JSON.stringify(body),
-    signal: request.signal,
-  }))
-  const { id, ...rest } = args
+  const dispatch = async (path: string, body?: Record<string, unknown>) => {
+    let nonFiniteNumber = false
+    const payload = body && JSON.stringify(body, (_key, value: unknown) => {
+      if (typeof value === 'number' && !Number.isFinite(value)) nonFiniteNumber = true
+      return value
+    })
+    if (nonFiniteNumber) {
+      return Response.json({ code: 'invalid_argument', message: 'Use finite numbers in JSON tool arguments.' }, { status: 400 })
+    }
+    return send(new Request(new URL(path, request.url), {
+      method: body ? 'POST' : 'GET',
+      headers: { Authorization: request.headers.get('Authorization')!, ...(body && { 'Content-Type': 'application/json' }) },
+      body: payload,
+      signal: request.signal,
+    }))
+  }
+  const { id, epoch, ...rest } = args
   if (name !== 'list' && name !== 'claim' && (typeof id !== 'number' || !Number.isSafeInteger(id) || id < 1)) {
-    return invalidTool(session, 'Use a positive integer task ID.')
+    return invalidTool('Use a positive integer task ID.')
   }
   const task = `/tasks/${id}`
   let response: Response
@@ -88,33 +99,37 @@ async function callTool(request: Request, send: Fetch, session: Session, name: s
     for (const filter of ['queue', 'state']) {
       if (!Object.hasOwn(args, filter)) continue
       const value = args[filter]
-      if (typeof value !== 'string') return invalidTool(session, `${filter} must be a string.`)
+      if (typeof value !== 'string') return invalidTool(`${filter} must be a string.`)
       query.set(filter, value)
     }
     if (Object.hasOwn(args, 'labels')) {
       const { labels } = args
-      if (!isObject(labels)) return invalidTool(session, 'Supply labels as an object mapping strings to strings.')
+      if (!isObject(labels)) return invalidTool('Supply labels as an object mapping strings to strings.')
       for (const [key, value] of Object.entries(labels)) {
-        if (!key || key.includes('=') || typeof value !== 'string') return invalidTool(session, 'Use non-empty label names without = and string values.')
+        if (!key || key.includes('=') || typeof value !== 'string') return invalidTool('Use non-empty label names without = and string values.')
         query.append('label', `${key}=${value}`)
       }
     }
     response = await dispatch(`/tasks?${query}`)
   } else if (name === 'show' || (name === 'memo' && !Object.hasOwn(args, 'value'))) {
     const key = args.key
-    if (name === 'memo' && (typeof key !== 'string' || !key.trim())) return invalidTool(session, 'key must be a non-empty string.')
+    if (name === 'memo' && (typeof key !== 'string' || !key.trim())) return invalidTool('key must be a non-empty string.')
     response = await dispatch(task)
     if (name === 'memo' && response.ok && typeof key === 'string') {
       const { memos } = await response.json() as { memos: Record<string, unknown> }
       return Object.hasOwn(memos, key)
-        ? toolResult(session, { value: memos[key] })
-        : toolResult(session, { code: 'not_found', message: 'No memo with that key is set on this task.' }, true)
+        ? toolResult({ value: memos[key] })
+        : toolResult({ code: 'not_found', message: 'No memo with that key is set on this task.' }, true)
     }
   } else {
     const body = { request_id: crypto.randomUUID(), ...rest }
     if (HOLDER_ACTIONS.some((action) => action === name)) {
-      const epoch = session.epochs.get(id as number)
-      if (epoch === undefined) return toolResult(session, { code: 'claim_lost', message: 'Claim the task in this MCP session before writing.' }, true)
+      if (typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 1) {
+        return invalidTool('Supply the positive integer epoch returned by the claim for this attempt.')
+      }
+      if (!session.claims.has(`${id}:${epoch}`)) {
+        return toolResult({ code: 'claim_lost', message: 'Claim the task in this MCP session before writing.' }, true)
+      }
       response = await dispatch(`${task}/${name}`, { ...body, epoch })
     } else {
       response = await dispatch(name === 'claim' ? '/tasks/claim' : `${task}/${name}`, body)
@@ -123,9 +138,9 @@ async function callTool(request: Request, send: Fetch, session: Session, name: s
   const data = await response.json()
   if (response.ok && name === 'claim') {
     const { id, epoch } = data as { id: number; epoch: number }
-    if (epoch > (session.epochs.get(id) ?? 0)) session.epochs.set(id, epoch)
+    session.claims.add(`${id}:${epoch}`)
   }
-  return toolResult(session, data, !response.ok)
+  return toolResult(data, !response.ok)
 }
 
 export function createMcp(readJson: (request: Request) => Promise<unknown>) {
@@ -178,7 +193,7 @@ export function createMcp(readJson: (request: Request) => Promise<unknown>) {
       for (const [key, stale] of sessions) if (now - stale.lastUsed >= SESSION_IDLE_MS) sessions.delete(key)
       const version = VERSIONS.includes(params.protocolVersion) ? params.protocolVersion : VERSIONS[0]
       const sessionId = crypto.randomUUID()
-      sessions.set(sessionId, { actor, version, initialized: false, lastUsed: performance.now(), epochs: new Map() })
+      sessions.set(sessionId, { actor, version, initialized: false, lastUsed: performance.now(), claims: new Set() })
       return rpcResult(id, {
         protocolVersion: version,
         capabilities: { tools: {} },
@@ -202,7 +217,7 @@ export function createMcp(readJson: (request: Request) => Promise<unknown>) {
     const args = params.arguments === undefined ? {} : params.arguments
     if (!isObject(args)) return rpcError(id, -32602, 'Supply tool arguments as a JSON object.')
     if (Object.keys(args).some((key) => !Object.hasOwn(selected.inputSchema.properties, key))) {
-      return rpcResult(id, invalidTool(session, 'Supply only the arguments listed in the tool schema.'))
+      return rpcResult(id, invalidTool('Supply only the arguments listed in the tool schema.'))
     }
     return rpcResult(id, await callTool(request, send, session, selected.name, args))
   }

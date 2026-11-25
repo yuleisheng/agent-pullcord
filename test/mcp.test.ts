@@ -26,9 +26,9 @@ async function hub(t: TestContext) {
     agent, sha256: createHash('sha256').update(token).digest('hex'), queues, can,
   })
   const server = createHttpServer(store, [
-    key('worker', worker, ['work/'], ['read', 'claim', 'renew', 'complete', 'log', 'memo']),
+    key('worker', worker, ['work/'], ['read', 'claim', 'renew', 'complete', 'release', 'log', 'memo']),
     key('reader', reader, ['work/'], ['read']),
-    key('watcher', watcher, ['*'], ['read', 'events']),
+    key('watcher', watcher, ['*'], ['read', 'events', 'log']),
   ], [], new URL(`${publicOrigin}/proxy-prefix`))
   t.after(async () => {
     const closed = once(server, 'close')
@@ -46,18 +46,20 @@ async function hub(t: TestContext) {
   const request = (key: string, headers: HeadersInit = {}, method = 'POST', message?: unknown) => fetch(`${url}/mcp`, {
     method, headers: { Authorization: `Bearer ${key}`, Accept: 'application/json, text/event-stream',
       'Content-Type': 'application/json', ...headers },
-    body: message === undefined ? undefined : JSON.stringify({ jsonrpc: '2.0', ...message as object }),
+    body: typeof message === 'string' || message === undefined ? message : JSON.stringify({ jsonrpc: '2.0', ...message as object }),
     signal: AbortSignal.timeout(5_000),
   })
 
-  async function connect(key: string, origin?: string) {
-    const response = await request(key, origin ? { Origin: origin } : {}, 'POST', initialize)
+  async function connect(key: string, origin?: string, protocolVersion = version) {
+    const response = await request(key, origin ? { Origin: origin } : {}, 'POST', {
+      ...initialize, params: { ...initialize.params, protocolVersion },
+    })
     assert.equal(response.status, 200)
     assert.match(response.headers.get('Content-Type') ?? '', /^application\/json/)
-    assert.equal((await response.json()).result.protocolVersion, version)
+    assert.equal((await response.json()).result.protocolVersion, protocolVersion)
     const session = response.headers.get('MCP-Session-Id')
     assert.ok(session)
-    const headers = { 'MCP-Session-Id': session, 'MCP-Protocol-Version': version, ...(origin && { Origin: origin }) }
+    const headers = { 'MCP-Session-Id': session, 'MCP-Protocol-Version': protocolVersion, ...(origin && { Origin: origin }) }
     const send = (message: object) => request(key, headers, 'POST', message)
     const notification = await send({ method: 'notifications/initialized' })
     assert.equal(notification.status, 202)
@@ -110,8 +112,21 @@ test('MCP checks the actual origins and authenticates the bearer on every sessio
   assert.deepEqual((await remote.rpc('ping')).result, {})
 })
 
+test('MCP negotiates supported JSON protocol revisions without advertising batching', { timeout: 10_000 }, async (t) => {
+  const { request, connect } = await hub(t)
+  const legacyVersion = '2025-03-26'
+  const legacy = await request(worker, {}, 'POST', {
+    ...initialize, params: { ...initialize.params, protocolVersion: legacyVersion },
+  })
+  assert.equal(legacy.status, 200)
+  assert.equal((await legacy.json()).result.protocolVersion, version)
+  assert.equal((await request(worker, { 'MCP-Protocol-Version': legacyVersion }, 'POST', initialize)).status, 400)
+  const june = await connect(worker, undefined, '2025-06-18')
+  assert.deepEqual((await june.rpc('ping')).result, {})
+})
+
 test('MCP tool discovery and calls preserve HTTP scopes, untrusted data, wait bounds and first-write memos', { timeout: 10_000 }, async (t) => {
-  const { connect, untrusted } = await hub(t)
+  const { connect, events, untrusted } = await hub(t)
   const a = await connect(worker)
   const b = await connect(reader)
   const { tools } = (await a.rpc('tools/list')).result
@@ -124,6 +139,13 @@ test('MCP tool discovery and calls preserve HTTP scopes, untrusted data, wait bo
   assert.equal(Object.hasOwn(visible, 'cursor'), false)
   await a.call('show', { id: 2 }, 'not_found')
   await b.call('log', { id: 1, text: 'not authorized' }, 'forbidden')
+  const note = await a.call('log', { id: 1, text: 'Scoped note', request_id: 'scoped-note' })
+  assert.equal(Object.hasOwn(note, 'seq'), false)
+  assert.deepEqual((await events()).at(-1), { seq: 3, ...note })
+  const c = await connect(watcher)
+  const watchNote = await c.call('log', { id: 1, text: 'Watch note' })
+  assert.equal(watchNote.seq, 4)
+  assert.deepEqual((await events()).at(-1), watchNote)
   await a.call('claim', { queue: 'work/', wait: 31 }, 'invalid_argument')
   await a.call('claim', { queue: 'private' }, 'forbidden')
   await a.call('memo', { id: 1, key: 'decision' }, 'not_found')
@@ -132,7 +154,22 @@ test('MCP tool discovery and calls preserve HTTP scopes, untrusted data, wait bo
   assert.deepEqual(await b.call('memo', { id: 1, key: 'decision' }), { value: null })
 })
 
-test('a new MCP session cannot borrow a lease, and neither stale epochs nor write replays append events', { timeout: 10_000 }, async (t) => {
+test('an MCP memo cannot silently change a non-finite JSON number into null', { timeout: 10_000 }, async (t) => {
+  const { connect, events, request } = await hub(t)
+  const session = await connect(worker)
+  const before = await events()
+  const response = await request(worker, session.headers, 'POST',
+    '{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{"name":"memo","arguments":{"id":1,"key":"decision","value":{"nested":[1e400]},"request_id":"memo-once"}}}')
+  assert.equal(response.status, 200)
+  const { result } = await response.json()
+  assert.equal(result.isError, true)
+  assert.equal(result.structuredContent.code, 'invalid_argument')
+  await session.call('memo', { id: 1, key: 'decision' }, 'not_found')
+  assert.deepEqual(await events(), before)
+  assert.deepEqual(await session.call('memo', { id: 1, key: 'decision', value: null, request_id: 'memo-once' }), { value: null })
+})
+
+test('same-session MCP reclaims fence delayed work and a new session can replay the original claim', { timeout: 10_000 }, async (t) => {
   const { connect, advance, events } = await hub(t)
   const a = await connect(worker)
   const b = await connect(worker)
@@ -140,19 +177,45 @@ test('a new MCP session cannot borrow a lease, and neither stale epochs nor writ
   const first = await a.call('claim', firstClaim)
   assert.equal(first.epoch, 1)
   await b.call('show', { id: first.id })
-  await b.call('complete', { id: first.id, epoch: first.epoch }, 'invalid_argument')
-  await b.call('complete', { id: first.id }, 'claim_lost')
+  await b.call('complete', { id: first.id, epoch: first.epoch }, 'claim_lost')
+  await a.call('complete', { id: first.id }, 'invalid_argument')
+
   advance(10_000)
-  const fresh = await b.call('claim', { queue: 'work/', lease: 10 })
+  const secondClaim = { ...firstClaim, request_id: 'second-claim' }
+  const fresh = await a.call('claim', secondClaim)
   assert.equal(fresh.epoch, 2)
   assert.equal(fresh.id, first.id)
-  assert.deepEqual(await b.call('claim', firstClaim), first)
+  assert.deepEqual(await a.call('claim', firstClaim), first)
   const before = await events()
-  await a.call('complete', { id: first.id, result: 'stale' }, 'claim_lost')
+  await a.call('complete', { id: first.id, epoch: first.epoch, result: 'stale', request_id: 'delayed-work' }, 'claim_lost')
   assert.deepEqual(await events(), before)
-  const finish = { id: fresh.id, result: 'settled', request_id: 'finish-once' }
-  const completed = await b.call('complete', finish)
+  const finish = { id: fresh.id, epoch: fresh.epoch, result: 'settled', request_id: 'finish-once' }
+  const completed = await a.call('complete', finish)
   assert.deepEqual([completed.state, completed.result], ['completed', 'settled'])
+  assert.deepEqual(await a.call('complete', finish), completed)
+  await b.call('complete', finish, 'claim_lost')
+  assert.deepEqual(await b.call('claim', secondClaim), fresh)
   assert.deepEqual(await b.call('complete', finish), completed)
   assert.deepEqual((await events()).slice(before.length).map(({ type }: { type: string }) => type), ['task.completed'])
+})
+
+test('MCP claim races pick one holder and a successful old release replays after reclaim', { timeout: 10_000 }, async (t) => {
+  const { connect, events } = await hub(t)
+  const sessions = await Promise.all([connect(worker), connect(worker)])
+  const contenders = await Promise.all(sessions.map((session, index) => session.rpc('tools/call', {
+    name: 'claim', arguments: { queue: 'work/', request_id: `race-${index}` },
+  })))
+  const winner = contenders.findIndex(({ result }) => !result.isError)
+  assert.notEqual(winner, -1)
+  assert.equal(contenders[1 - winner].result.structuredContent.code, 'nothing_ready')
+
+  const session = sessions[winner]
+  const { id, epoch } = contenders[winner].result.structuredContent
+  const release = { id, epoch, request_id: 'release-once' }
+  const released = await session.call('release', release)
+  assert.equal(released.state, 'ready')
+  const reclaimed = await session.call('claim', { queue: 'work/', request_id: 'reclaim' })
+  assert.deepEqual([reclaimed.id, reclaimed.epoch], [id, epoch + 1])
+  assert.deepEqual(await session.call('release', release), released)
+  assert.deepEqual((await events()).slice(2).map(({ type }: { type: string }) => type), ['task.claimed', 'task.released', 'task.claimed'])
 })
