@@ -167,6 +167,13 @@ test('release, retry and block pass their distinct holder operations to the serv
 })
 
 const worker = `console.log('worker ' + process.pid); setInterval(() => {}, 10_000)`
+const wrappedWorker = process.platform === 'win32' ? worker : `
+  const { spawn } = require('node:child_process');
+  const child = spawn(process.execPath, ['-e', ${JSON.stringify(worker)}], { stdio: ['ignore', 'pipe', 'ignore'] });
+  child.stdout.pipe(process.stdout);
+  process.on('SIGINT', () => {});
+  process.on('SIGTERM', () => {});
+`
 
 async function matchingLine(stream: NonNullable<ChildProcess['stdout']>, match: (line: string) => boolean) {
   const lines = createInterface({ input: stream })
@@ -178,11 +185,19 @@ async function matchingLine(stream: NonNullable<ChildProcess['stdout']>, match: 
   assert.fail('The command exited without the expected output.')
 }
 
-async function workerPid(child: ChildProcess) {
-  return Number((await matchingLine(child.stderr!, (line) => /^worker \d+$/.test(line))).slice('worker '.length))
+async function workerPid(t: TestContext, child: ChildProcess) {
+  const pid = Number((await matchingLine(child.stderr!, (line) => /^worker \d+$/.test(line))).slice('worker '.length))
+  t.after(() => {
+    try {
+      process.kill(pid, 'SIGKILL')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+    }
+  })
+  return pid
 }
 
-test('run executes literal command arguments, settles from exit status, and releases only after Ctrl-C stops the child', { timeout: 10_000 }, async (t) => {
+test('run executes literal command arguments, settles from exit status, and stops the wrapped worker before release', { timeout: 10_000 }, async (t) => {
   const server = await hub(t)
   const queue = 'incidents/run'
   const id = server.seed(queue, 'success')
@@ -196,15 +211,15 @@ test('run executes literal command arguments, settles from exit status, and rele
   assert.deepEqual([failed.state, failed.reason], ['failed', 'Command exited with status 23.'])
 
   const interruptId = server.seed(queue, 'interrupt')
-  const running = server.start(['run', queue, '--', process.execPath, '-e', worker])
-  const pid = await workerPid(running.child)
+  const running = server.start(['run', queue, '--', process.execPath, '-e', wrappedWorker])
+  const pid = await workerPid(t, running.child)
   assert.equal(running.child.kill('SIGINT'), true)
   const released = success(await running.done, 130)
   assert.deepEqual([released.id, released.state, released.attempts], [interruptId, 'ready', 0])
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' })
 })
 
-test('run renews at a third of the lease and stops its child when renewal loses the claim', { timeout: 10_000 }, async (t) => {
+test('run renews at a third of the lease and stops its wrapped worker when renewal loses the claim', { timeout: 10_000 }, async (t) => {
   const server = await hub(t)
   const queue = 'incidents/renewal'
   const id = String(server.seed(queue, 'lose-lease'))
@@ -219,9 +234,9 @@ test('run renews at a third of the lease and stops its child when renewal loses 
       return once(process, 'message', { signal: options.signal }).then(() => value);
     };
     syncBuiltinESMExports();`
-  const running = server.start(['run', queue, '--', process.execPath, '-e', worker], first, preload)
+  const running = server.start(['run', queue, '--', process.execPath, '-e', wrappedWorker], first, preload)
   const scheduled = once(running.child, 'message')
-  const pid = await workerPid(running.child)
+  const pid = await workerPid(t, running.child)
   assert.equal(success(await server.call(['show', id])).lease_expires_at, clockStart + 900_000)
   assert.equal((await scheduled)[0], 'scheduled')
   server.setTime(clockStart + 300_000)
@@ -266,6 +281,10 @@ test('log and memo need no epoch, but admin writes still enforce scope and cance
   assert.deepEqual(success(await server.call(['memo', id, 'approved', 'false'])), { value: false })
   assert.deepEqual(success(await server.call(['memo', id, 'approved', 'true'])), { value: false })
   assert.deepEqual(success(await server.call(['memo', id, 'approved'])), { value: false })
+  failure(await server.call(['memo', id, 'number', '{"nested":[1e400]}']), 'invalid_argument')
+  failure(await server.call(['memo', id, 'number']), 'not_found')
+  assert.deepEqual(success(await server.call(['memo', id, 'number', '42'])), { value: 42 })
+  assert.deepEqual(success(await server.call(['memo', id, 'note', 'free text'])), { value: 'free text' })
   failure(await server.call(['memo', id, 'constructor']), 'not_found')
 
   success(await server.call(['claim', queue]))
@@ -296,11 +315,15 @@ test('events --follow emits in order, retries the last emitted cursor, and abort
     if (after === '4') res.end(JSON.stringify({ events: [{ seq: 5 }, { seq: 6 }], cursor: 6 }))
     else if (after === '6' && seen.length === 3) {
       res.writeHead(503).end(JSON.stringify({ code: 'internal_error', message: 'Temporarily restarting.' }))
+    } else if (after === '6' && seen.length === 4) {
+      res.writeHead(200, { 'Content-Length': '100' })
+      res.write('{"events":[{"seq":7}', () => res.destroy())
     } else if (after === '6') res.end(JSON.stringify({ events: [{ seq: 7 }], cursor: 7 }))
     else if (after === '7') {
       res.once('close', disconnected)
       reached()
-    } else res.writeHead(400).end(JSON.stringify({ code: 'invalid_argument', message: 'Unexpected cursor.' }))
+    } else if (after === '9') res.end('{"events":')
+    else res.writeHead(400).end(JSON.stringify({ code: 'invalid_argument', message: 'Unexpected cursor.' }))
   }))
   const command = cli(t, directory(t), url)
   assert.deepEqual(success(await command.call(['events', '--after', '4'])), { events: [{ seq: 5 }, { seq: 6 }], cursor: 6 })
@@ -311,8 +334,39 @@ test('events --follow emits in order, retries the last emitted cursor, and abort
   assert.equal(stopped.code, 130)
   assert.equal(stopped.stderr, '')
   assert.deepEqual(stopped.stdout.trim().split('\n').map((line) => JSON.parse(line)), [{ seq: 5 }, { seq: 6 }, { seq: 7 }])
-  assert.deepEqual(seen, [['4', null], ['4', '30'], ['6', '30'], ['6', '30'], ['7', '30']])
+  assert.deepEqual(seen, [['4', null], ['4', '30'], ['6', '30'], ['6', '30'], ['6', '30'], ['7', '30']])
   await closed
+  failure(await command.call(['events', '--after', '9', '--follow']), 'invalid_response')
+  assert.deepEqual(seen.at(-1), ['9', '30'])
+})
+
+test('a setup crash leaves a lock that can be recovered without overwriting configuration', { timeout: 10_000 }, async (t) => {
+  const dir = directory(t)
+  const command = cli(t, dir)
+  const keys = 'pullcord-keys.json'
+  const lock = `${keys}.pullcord-lock`
+  success(await command.call(['init']))
+  const before = readFileSync(join(dir, keys), 'utf8')
+  const preload = `
+    import { createRequire, syncBuiltinESMExports } from 'node:module';
+    const fs = createRequire('/preload.js')('node:fs');
+    const open = fs.openSync;
+    fs.openSync = (path, ...args) => {
+      const fd = open(path, ...args);
+      if (path === ${JSON.stringify(lock)}) process.kill(process.pid, 'SIGKILL');
+      return fd;
+    };
+    syncBuiltinESMExports();`
+  const args = ['keys', 'revoke', 'admin']
+  const crashed = await command.start(args, first, preload).done
+  assert.equal(crashed.signal, 'SIGKILL')
+  const blocked = failure(await command.call(args), 'store_locked')
+  assert.ok(blocked.message.includes(lock))
+  assert.match(blocked.message, /stop all setup commands/i)
+  assert.equal(readFileSync(join(dir, keys), 'utf8'), before)
+  rmSync(join(dir, lock))
+  assert.equal(success(await command.call(args)).revoked, true)
+  assert.deepEqual(success(await command.call(['keys', 'list'])), { keys: [] })
 })
 
 test('init and keys issue secrets once and serve reloads revocation only on restart', { timeout: 15_000 }, async (t) => {

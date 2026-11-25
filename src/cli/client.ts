@@ -55,11 +55,17 @@ export class Client {
       signal?.throwIfAborted()
       throw new CliError('network_error', 'Could not reach the hub. Check PULLCORD_URL and try again.')
     }
-    let data: unknown
+    let responseBody: string
     try {
-      data = await response.json()
+      responseBody = await response.text()
     } catch {
       signal?.throwIfAborted()
+      throw new CliError('network_error', 'The connection to the hub ended before its response was read. Try again.', response.status)
+    }
+    let data: unknown
+    try {
+      data = JSON.parse(responseBody)
+    } catch {
       throw new CliError('invalid_response', 'The hub did not return JSON.', response.status)
     }
     if (!response.ok) {
