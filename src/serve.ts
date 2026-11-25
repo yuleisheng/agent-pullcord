@@ -31,9 +31,10 @@ function serve(): void {
     },
   })
   if (!values.keys) throw new Error('Pass --keys <path> to a JSON file of scoped key digests.')
-  const addr = /^(\[[^\]]+\]|[^:]+):(\d+)$/.exec(values.listen)
-  if (!addr || Number(addr[2]) > 65535) throw new Error('Pass --listen as host:port (use [address]:port for IPv6).')
-  const host = addr[1].replace(/^\[|\]$/g, '')
+  const addr = /^(?:\[([^\s[\]]+)\]|([^:\s[\]]+)):(\d+)$/.exec(values.listen)
+  if (!addr || Number(addr[3]) > 65535) throw new Error('Pass --listen as host:port (use [address]:port for IPv6).')
+  const host = addr[1] ?? addr[2]
+  const port = Number(addr[3])
   const rawKeys = readFileSync(values.keys, 'utf8')
   let keys: unknown
   try {
@@ -49,7 +50,7 @@ function serve(): void {
     process.exitCode = 1
   })
   server.once('close', () => store.close())
-  server.listen(Number(addr[2]), host, () => {
+  server.listen(port, host, () => {
     const bound = server.address()
     if (bound && typeof bound !== 'string') {
       const address = bound.family === 'IPv6' ? `[${bound.address}]` : bound.address

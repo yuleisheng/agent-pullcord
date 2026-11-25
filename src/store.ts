@@ -1,4 +1,7 @@
 import { DatabaseSync } from 'node:sqlite'
+import { DEFAULT_LEASE_MS, MAX_LEASE_MS, MIN_LEASE_MS, StoreError } from './store-contract.ts'
+
+export { DEFAULT_LEASE_MS, MAX_LEASE_MS, MIN_LEASE_MS, StoreError, type ErrorCode } from './store-contract.ts'
 
 export type TaskState = 'ready' | 'claimed' | 'blocked' | 'interrupted' | 'completed' | 'failed' | 'canceled'
 export type Retry = 'safe' | 'manual'
@@ -75,26 +78,6 @@ export interface Holder extends Writer {
   epoch: number
 }
 
-export type ErrorCode =
-  | 'not_found'
-  | 'claim_lost'
-  | 'invalid_transition'
-  | 'invalid_argument'
-  | 'request_id_reused'
-  | 'store_locked'
-
-export class StoreError extends Error {
-  readonly code: ErrorCode
-  constructor(code: ErrorCode, message: string) {
-    super(message)
-    this.name = 'StoreError'
-    this.code = code
-  }
-}
-
-export const DEFAULT_LEASE_MS = 15 * 60_000
-export const MIN_LEASE_MS = 10_000
-export const MAX_LEASE_MS = 60 * 60_000
 const DEFAULT_MAX_ATTEMPTS = 3
 const HUB: Writer = { actor: 'pullcord' }
 const TERMINAL: ReadonlySet<TaskState> = new Set(['completed', 'failed', 'canceled'])

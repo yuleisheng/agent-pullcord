@@ -24,4 +24,6 @@ From a shell with that same key, list tasks:
 printf 'Authorization: Bearer %s\n' "$PULLCORD_KEY" | curl --fail-with-body -H @- http://127.0.0.1:7337/tasks
 ```
 
-A new database returns an empty list. Use an existing task-store database to read populated tasks. The server listens on loopback by default; use TLS at a reverse proxy before exposing it outside the machine. To revoke a key, remove its entry from the file and restart the server.
+A new database returns an empty list. Use an existing task-store database to read populated tasks. The global event cursor appears only for keys with both `"*"` queue access and the `events` action, in addition to `read`. The event endpoint is not implemented yet.
+
+The server listens on loopback by default; use TLS at a reverse proxy before exposing it outside the machine. Keys are loaded at startup. To revoke a key, remove its entry from the file and restart the server.
