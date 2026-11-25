@@ -23,6 +23,8 @@ export interface Task {
   holder: string | null
   epoch: number
   leaseExpiresAt: number | null
+  /** When the task last became ready; null unless it is ready. Claims take the smallest first. */
+  readyAt: number | null
   result: string | null
   /** Why the task is blocked, interrupted, failed, or canceled. */
   reason: string | null
@@ -91,7 +93,7 @@ export class StoreError extends Error {
 }
 
 export const DEFAULT_LEASE_MS = 15 * 60_000
-export const MIN_LEASE_MS = 1_000
+export const MIN_LEASE_MS = 10_000
 export const MAX_LEASE_MS = 60 * 60_000
 const DEFAULT_MAX_ATTEMPTS = 3
 const HUB: Writer = { actor: 'pullcord' }
@@ -118,13 +120,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   holder TEXT,
   epoch INTEGER NOT NULL,
   lease_expires_at INTEGER,
+  ready_at INTEGER,
   result TEXT,
   reason TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   UNIQUE (source, dedupe_key)
 );
-CREATE INDEX IF NOT EXISTS tasks_by_state ON tasks (state, queue, id);
+CREATE INDEX IF NOT EXISTS tasks_by_state ON tasks (state, ready_at, id);
 CREATE INDEX IF NOT EXISTS tasks_by_lease ON tasks (state, lease_expires_at);
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY,
@@ -176,6 +179,7 @@ interface Row {
   holder: string | null
   epoch: number
   lease_expires_at: number | null
+  ready_at: number | null
   result: string | null
   reason: string | null
   created_at: number
@@ -238,9 +242,9 @@ export class Store {
       const { lastInsertRowid } = this.#db
         .prepare(
           `INSERT INTO tasks (queue, kind, source, dedupe_key, correlation_key, title, severity, labels, source_url,
-             payload, adapter, retry, max_attempts, attempts, state, holder, epoch, lease_expires_at, result, reason,
+             payload, adapter, retry, max_attempts, attempts, state, holder, epoch, lease_expires_at, ready_at, result, reason,
              created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'ready', NULL, 0, NULL, NULL, NULL, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'ready', NULL, 0, NULL, ?, NULL, NULL, ?, ?)`,
         )
         .run(
           input.queue,
@@ -258,6 +262,7 @@ export class Store {
           maxAttempts,
           now,
           now,
+          now,
         )
       const row = this.#row(Number(lastInsertRowid))
       this.#event(row.id, 'task.created', who, null, 'ready', { queue: row.queue, source: row.source, dedupeKey: row.dedupe_key }, now)
@@ -266,7 +271,7 @@ export class Store {
   }
 
   /**
-   * Claims the oldest ready task in `queue` (or under it, when `queue` ends with "/")
+   * Claims the task that has been ready longest in `queue` (or under it, when `queue` ends with "/")
    * that has every label in `labels`. Returns null when none is ready.
    */
   claim(filter: { queue: string; labels?: Labels; leaseMs?: number }, who: Writer): Task | null {
@@ -274,7 +279,7 @@ export class Store {
     need(filter.labels === undefined || isLabels(filter.labels), 'labels must map strings to strings')
     const leaseMs = checkLease(filter.leaseMs)
     return this.#write('claim', null, { queue: filter.queue, labels: sortedLabels(filter.labels), leaseMs }, who, (now) => {
-      const row = this.#rows('ready', filter.queue).find((candidate) => hasLabels(candidate, filter.labels))
+      const row = this.#rows('ready', filter.queue, 'ready_at, id').find((candidate) => hasLabels(candidate, filter.labels))
       if (!row) return null
       return toTask(
         this.#move(row, 'task.claimed', 'claimed', who, now, {
@@ -337,7 +342,7 @@ export class Store {
   }
 
   requeue(id: number, who: Writer): Task {
-    return this.#write('requeue', id, {}, who, (now) => toTask(this.#reopen(id, 'interrupted', 'task.requeued', who, now)))
+    return this.#write('requeue', id, {}, who, (now) => toTask(this.#reopen(id, 'interrupted', 'task.requeued', who, now, (row) => ({ attempts: row.attempts - 1 }))))
   }
 
   cancel(id: number, who: Writer & { reason: string }): Task {
@@ -461,7 +466,7 @@ export class Store {
   #expireLeases(now: number): void {
     const expired = this.#all("SELECT * FROM tasks WHERE state = 'claimed' AND lease_expires_at <= ? ORDER BY id", now)
     for (const row of expired) {
-      const to: TaskState = row.attempts >= row.max_attempts ? 'failed' : row.retry === 'safe' ? 'ready' : 'interrupted'
+      const to: TaskState = row.retry === 'manual' ? 'interrupted' : row.attempts >= row.max_attempts ? 'failed' : 'ready'
       const reason = to === 'ready' ? null : `lease held by ${row.holder} expired`
       this.#moveAndClearClaim(row, 'task.lease_expired', to, HUB, now, { reason }, { holder: row.holder, epoch: row.epoch })
     }
@@ -476,10 +481,10 @@ export class Store {
     return row
   }
 
-  #reopen(id: number, from: TaskState, type: string, who: Writer, now: number): Row {
+  #reopen(id: number, from: TaskState, type: string, who: Writer, now: number, set: (row: Row) => Partial<Row> = () => ({})): Row {
     const row = this.#row(id)
     if (row.state !== from) throw new StoreError('invalid_transition', `Task ${id} is ${row.state}, not ${from}.`)
-    return this.#move(row, type, 'ready', who, now, { reason: null })
+    return this.#move(row, type, 'ready', who, now, { reason: null, ...set(row) })
   }
 
   #moveAndClearClaim(row: Row, type: string, to: TaskState, who: Writer, now: number, set: Partial<Row>, data?: unknown): Row {
@@ -487,10 +492,11 @@ export class Store {
   }
 
   #move(row: Row, type: string, to: TaskState, who: Writer, now: number, set: Partial<Row>, data?: unknown): Row {
-    const next: Row = { ...row, ...set, state: to, updated_at: now }
+    const readyAt = to !== 'ready' ? null : row.state === 'ready' ? row.ready_at : now
+    const next: Row = { ...row, ...set, state: to, ready_at: readyAt, updated_at: now }
     this.#db
-      .prepare('UPDATE tasks SET state = ?, holder = ?, epoch = ?, attempts = ?, lease_expires_at = ?, result = ?, reason = ?, updated_at = ? WHERE id = ?')
-      .run(next.state, next.holder, next.epoch, next.attempts, next.lease_expires_at, next.result, next.reason, now, row.id)
+      .prepare('UPDATE tasks SET state = ?, holder = ?, epoch = ?, attempts = ?, lease_expires_at = ?, ready_at = ?, result = ?, reason = ?, updated_at = ? WHERE id = ?')
+      .run(next.state, next.holder, next.epoch, next.attempts, next.lease_expires_at, next.ready_at, next.result, next.reason, now, row.id)
     const eventData = data ?? {
       epoch: next.epoch,
       leaseExpiresAt: next.lease_expires_at,
@@ -508,7 +514,7 @@ export class Store {
     return { seq: Number(lastInsertRowid), taskId, type, actor: who.actor, requestId: who.requestId ?? null, from, to, data: data ?? null, at: now }
   }
 
-  #rows(state: TaskState | undefined, queue: string | undefined): Row[] {
+  #rows(state: TaskState | undefined, queue: string | undefined, order = 'id'): Row[] {
     const where: string[] = []
     const params: (string | number)[] = []
     if (state !== undefined) {
@@ -519,7 +525,7 @@ export class Store {
       where.push(queue.endsWith('/') ? 'substr(queue, 1, length(?)) = ?' : 'queue = ?')
       params.push(...(queue.endsWith('/') ? [queue, queue] : [queue]))
     }
-    return this.#all(`SELECT * FROM tasks ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY id`, ...params)
+    return this.#all(`SELECT * FROM tasks ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order}`, ...params)
   }
 
   #row(id: number): Row {
@@ -587,6 +593,7 @@ function toTask(row: Row): Task {
     holder: row.holder,
     epoch: row.epoch,
     leaseExpiresAt: row.lease_expires_at,
+    readyAt: row.ready_at,
     result: row.result,
     reason: row.reason,
     createdAt: row.created_at,
