@@ -1,0 +1,20 @@
+{
+  "name": "agent-pullcord",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A headless, self-hosted task hub that turns events from services into tasks agents claim under a fenced lease.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "test": "node --test --disable-warning=ExperimentalWarning \"test/**/*.test.ts\"",
+    "typecheck": "tsc"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "fast-check": "^4.11.0",
+    "typescript": "^7.0.2"
+  }
+}
