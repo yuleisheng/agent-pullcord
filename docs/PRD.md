@@ -97,7 +97,7 @@ A **memo** is keyed by (`task_id`, `key`) and holds a JSON value.
 
 A claim counts an attempt. A release or a block gives it back, because the agent handed the task back instead of trying and failing. A requeue gives it back too, because a person decided to try again. This keeps every `ready` task below `max_attempts`, so a claim never pushes `attempts` past it.
 
-A claim takes the matching task that has been `ready` longest, by `ready_at`, then by `id`. Every move into `ready` sets `ready_at`, so a released, retried, unblocked, or requeued task goes to the back of the queue. An agent that keeps releasing one task can't starve the others.
+A queue claim takes the matching task that has been `ready` longest, by `ready_at`, then by `id`. An exact-ID claim only considers the named task. Every move into `ready` sets `ready_at`, so a released, retried, unblocked, or requeued task goes to the back of the queue. An agent that keeps releasing one task can't starve the others in a queue claim.
 
 Defaults: `retry: manual`, `max_attempts` 3, and a lease of 15 minutes. A lease can be 10 seconds to 1 hour, and the holder renews it.
 
@@ -128,14 +128,15 @@ Agent endpoints take `Authorization: Bearer <key>`. Task JSON uses snake_case fi
   - `GET /tasks?queue=&state=&label=`: returns `{ tasks }` with tasks in the key's queues. Only keys with the `*` queue grant and the `events` action also get `cursor`, the current global event cursor. An explicit `queue` must be within scope; a slash-terminated queue matches its descendants. Repeat `label=key=value` to require multiple labels.
   - `GET /tasks/:id`: returns one task with its `memos` object. Out-of-scope and missing IDs both return `404 not_found`.
 - **Watch** (requires the `*` queue grant and the `events` action):
-  - `GET /events?after=<cursor>&wait=<seconds>`: long-polls the complete, unfiltered event feed after the cursor. A watcher that takes its initial snapshot from `GET /tasks` also needs `read`.
-- **Claim and holder writes** return the resulting task. Each requires its action and queue grant plus a JSON object with a non-empty `request_id`. Bodies are limited to 64 KiB.
+  - `GET /events?after=<cursor>&wait=<seconds>`: returns `{ events, cursor }` with the complete, unfiltered feed after `after` (a non-negative integer, default 0). Events use `seq`, `task_id`, `type`, `actor`, `request_id`, `from`, `to`, `data`, and `at`. `cursor` is the last returned `seq`, or the requested `after` when no events are returned. The server waits for events for up to `wait` (0–30 whole seconds, default 0). A watcher that takes its initial snapshot from `GET /tasks` also needs `read`.
+- **Task writes** require a JSON object with a non-empty `request_id`, the relevant action, and a queue grant. Bodies are limited to 64 KiB. **Claim and holder writes** return the resulting task.
   - `POST /tasks/claim` with `{ request_id, queue, labels?, wait?, lease? }`: claims the match that has been ready longest, or waits up to `wait` (0–30 whole seconds, default 0). A `queue` ending in `/`, such as `incidents/`, matches every queue that starts with it; any other `queue` matches exactly. The requested selector must be within the key's grant. A match has every label in the `labels` object. If there is no match, returns `409 nothing_ready`. `wait` limits retries, not the identity of the write for `request_id` deduplication.
+  - To claim only one task, send `{ request_id, id, wait?, lease? }` to the same endpoint with a positive integer `id` and no `queue` or `labels`. The same claim grant and lease rules apply; `read` is not required. Missing and out-of-scope IDs both return `404 not_found`. An in-scope task that is not ready returns `409 nothing_ready` after any wait; the server never substitutes another task.
   - `POST /tasks/:id/renew`, `/complete`, `/fail`, `/release`, `/block` also take the `epoch` returned by claim. The actor comes from the key, not the body; missing and out-of-scope IDs both return `404 not_found`. `renew` accepts optional `lease`; `complete` accepts an optional string `result`; `fail` and `block` require a string `reason`; `fail` accepts optional boolean `retry` (default false). On claim and renew, `lease` is in whole seconds and uses the lifecycle bounds and default.
-- **Other writes:**
-  - `POST /tasks/:id/log`: appends a note to the task's log.
-  - `POST /tasks/:id/memo` with `{ key, value }`: first write wins.
-  - `POST /tasks/:id/unblock`, `/requeue`, `/cancel`: for people and admin keys.
+- **Other task writes** do not require a claim or epoch. Missing and out-of-scope IDs both return `404 not_found`.
+  - `POST /tasks/:id/log` with `{ request_id, text }`: appends a non-empty note and returns the event. Requires `log`.
+  - `POST /tasks/:id/memo` with `{ request_id, key, value }`: first write wins; returns `{ value }` with the stored JSON value, including `null`. Requires `memo`. To read without writing, use the `memos` in `GET /tasks/:id` with `read`.
+  - `POST /tasks/:id/unblock`, `/requeue`, `/cancel`: require `admin` and return the resulting task. `cancel` also takes a non-empty `reason`.
 
 ### CLI
 

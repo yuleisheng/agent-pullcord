@@ -308,10 +308,14 @@ async function workingHub(t: TestContext, name: string) {
     return clock
   } })
   const server = createHttpServer(store, [
-    credential('a', agentA, ['incidents/'], ['claim', 'renew', 'complete', 'release', 'fail', 'block']),
-    credential('b', agentB, ['incidents/'], ['claim', 'complete']),
-    credential('reader', reader, ['incidents/'], ['read']),
+    credential('a', agentA, ['incidents/'], ['claim', 'renew', 'complete', 'release', 'fail', 'block', 'log', 'memo']),
+    credential('b', agentB, ['incidents/'], ['claim', 'complete', 'memo']),
+    credential('reader', reader, ['incidents/'], ['read', 'events']),
     credential('exact', exact, ['incidents/search'], ['claim', 'complete']),
+    credential('watcher', watcher, ['*'], ['read', 'events']),
+    credential('events-only', blind, ['*'], ['events']),
+    credential('no-events', allReader, ['*'], ['read']),
+    credential('operator', unknownKey, [checkoutQueue], ['admin']),
   ])
   t.after(async () => {
     const closed = once(server, 'close')
@@ -473,4 +477,102 @@ test('a disconnected HTTP claim stops looking for a task', { timeout: 10_000 }, 
   const { tasks } = await ok(await hub.get('/tasks?state=ready', reader))
   assert.deepEqual(tasks.map((task: { id: number }) => task.id), [id])
   assert.deepEqual(hub.store.events().map(({ type }) => type), ['task.created'])
+})
+
+test('an exact-ID claim applies action, queue, lease and replay rules without falling back to the queue', { timeout: 10_000 }, async (t) => {
+  const hub = await workingHub(t, 'exact-claim')
+  const older = ingestTask(hub.store, checkoutQueue, 'older-ready-task')
+  const id = ingestTask(hub.store, checkoutQueue, 'selected-by-id')
+  const body = { id, lease: 10, request_id: 'exact' }
+  await error(await hub.post(claimPath, reader, body), 403, 'forbidden')
+  await error(await hub.post(claimPath, exact, body), 404, 'not_found')
+  await error(await hub.post(claimPath, agentA, { ...body, id: 999 }), 404, 'not_found')
+  await error(await hub.post(claimPath, agentA, { ...body, queue: checkoutQueue }), 400, 'invalid_argument')
+  await error(await hub.post(claimPath, agentA, { ...body, labels: {} }), 400, 'invalid_argument')
+
+  const contenders = [agentA, agentB]
+  const responses = await Promise.all(contenders.map((key) => hub.post(claimPath, key, body)))
+  const winner = responses.findIndex((response) => response.status === 200)
+  assert.notEqual(winner, -1)
+  await error(responses[1 - winner], 409, 'nothing_ready')
+  const task = await ok(responses[winner])
+  assert.deepEqual([task.id, task.epoch, task.lease_expires_at], [id, 1, now + 10_000])
+  assert.deepEqual(await ok(await hub.post(claimPath, contenders[winner], { ...body, wait: 1 })), task)
+  await error(await hub.post(claimPath, contenders[winner], { ...body, id: older }), 409, 'request_id_reused')
+  assert.equal((await ok(await hub.get(`/tasks/${older}`, reader))).state, 'ready')
+  assert.deepEqual((await ok(await hub.get('/events?after=2', watcher))).events.map((event: { type: string; task_id: number }) => [event.type, event.task_id]),
+    [['task.claimed', id]])
+})
+
+test('the global watch waits for new events and resumes at the exact cursor, without a hidden backlog cap', { timeout: 10_000 }, async (t) => {
+  const hub = await workingHub(t, 'watch')
+  const id = ingestTask(hub.store, checkoutQueue, 'in-scope')
+  await error(await hub.get('/events'), 401, 'unauthorized')
+  await error(await hub.get('/events', reader), 403, 'forbidden')
+  await error(await hub.get('/events', allReader), 403, 'forbidden')
+  for (const query of ['after=-1', 'after=0x1', 'after=9007199254740992', 'wait=31', 'wait=1.5']) {
+    await error(await hub.get(`/events?${query}`, watcher), 400, 'invalid_argument')
+  }
+
+  const checked = hub.nextAccess()
+  const waiting = hub.get('/events?after=1&wait=2', blind)
+  await checked
+  for (let i = 0; i < 102; i++) hub.store.log(id, { actor: 'agent:fixture', text: `note ${i}` })
+  const elsewhere = ingestTask(hub.store, 'outside', 'out-of-scope')
+  const { events, cursor } = await ok(await waiting)
+  assert.equal(cursor, 104)
+  assert.deepEqual(events.map(({ seq }: { seq: number }) => seq), Array.from({ length: 103 }, (_, i) => i + 2))
+  assert.deepEqual(events.at(-1), {
+    seq: cursor, task_id: elsewhere, type: 'task.created', actor: source.actor, request_id: null, from: null, to: 'ready',
+    data: { queue: 'outside', source: 'fixture', dedupeKey: 'out-of-scope' }, at: now,
+  })
+  assert.deepEqual(await ok(await hub.get(`/events?after=${cursor}`, watcher)), { events: [], cursor })
+})
+
+test('HTTP notes, memos and admin writes enforce their own scopes and survive repeat requests without extra events', { timeout: 10_000 }, async (t) => {
+  const hub = await workingHub(t, 'other-writes')
+  const id = ingestTask(hub.store, checkoutQueue, 'mutable')
+  const outside = ingestTask(hub.store, 'incidents/search', 'outside-admin')
+  const write = (action: string, key: string, request_id: string, fields = {}, task = id) =>
+    hub.post(`/tasks/${task}/${action}`, key, { request_id, ...fields })
+
+  const note = { text: 'one note', actor: 'agent:operator' }
+  await error(await write('log', agentB, 'note', note), 403, 'forbidden')
+  await error(await write('memo', exact, 'denied', { key: 'x', value: 1 }, outside), 403, 'forbidden')
+  await error(await write('memo', agentA, 'missing', { key: 'x' }), 400, 'invalid_argument')
+  const logged = await ok(await write('log', agentA, 'note', note))
+  assert.deepEqual(logged, { seq: 3, task_id: id, type: 'task.logged', actor: 'agent:a', request_id: 'note', from: 'ready', to: 'ready', data: { text: 'one note' }, at: now })
+  assert.deepEqual(await ok(await write('log', agentA, 'note', note)), logged)
+  await error(await write('memo', agentA, 'note', { key: 'x', value: 1 }), 409, 'request_id_reused')
+
+  const approval = { key: 'approval', value: null }
+  assert.deepEqual(await ok(await write('memo', agentA, 'first', approval)), { value: null })
+  assert.deepEqual(await ok(await write('memo', agentA, 'first', approval)), { value: null })
+  await error(await write('memo', agentA, 'first', { ...approval, value: false }), 409, 'request_id_reused')
+  assert.deepEqual(await ok(await write('memo', agentB, 'first', { ...approval, value: false })), { value: null })
+  assert.deepEqual((await ok(await hub.get(`/tasks/${id}`, reader))).memos, { approval: null })
+
+  const first = await ok(await hub.post(claimPath, agentA, { id, lease: 10, request_id: 'first-claim' }))
+  await error(await write('unblock', agentA, 'denied'), 403, 'forbidden')
+  await error(await write('unblock', unknownKey, 'unblock'), 409, 'invalid_transition')
+  await ok(await write('block', agentA, 'block', { reason: 'review', epoch: first.epoch }))
+  const unblocked = await ok(await write('unblock', unknownKey, 'unblock'))
+  assert.deepEqual([unblocked.state, unblocked.attempts], ['ready', 0])
+  assert.deepEqual(await ok(await write('unblock', unknownKey, 'unblock')), unblocked)
+
+  await ok(await hub.post(claimPath, agentA, { id, lease: 10, request_id: 'second-claim' }))
+  hub.advance(10_000)
+  const requeued = await ok(await write('requeue', unknownKey, 'requeue'))
+  assert.deepEqual([requeued.state, requeued.attempts], ['ready', 0])
+  const last = await ok(await hub.post(claimPath, agentA, { id, request_id: 'last-claim' }))
+  await error(await write('cancel', unknownKey, 'cancel', { reason: 'stop' }, outside), 404, 'not_found')
+  const canceled = await ok(await write('cancel', unknownKey, 'cancel', { reason: 'stop' }))
+  assert.deepEqual([canceled.state, canceled.reason, canceled.holder], ['canceled', 'stop', null])
+  await error(await write('complete', agentA, 'stale', { epoch: last.epoch }), 409, 'claim_lost')
+  await error(await write('requeue', unknownKey, 'terminal'), 409, 'invalid_transition')
+  const { events } = await ok(await hub.get('/events?after=2', watcher))
+  assert.deepEqual(events.map(({ type }: { type: string }) => type), [
+    'task.logged', 'task.memo', 'task.claimed', 'task.blocked', 'task.unblocked', 'task.claimed',
+    'task.lease_expired', 'task.requeued', 'task.claimed', 'task.canceled',
+  ])
 })

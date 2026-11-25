@@ -78,6 +78,8 @@ export interface Holder extends Writer {
   epoch: number
 }
 
+type ClaimFilter = ({ queue: string; labels?: Labels; id?: never } | { id: number; queue?: never; labels?: never }) & { leaseMs?: number }
+
 const DEFAULT_MAX_ATTEMPTS = 3
 const HUB: Writer = { actor: 'pullcord' }
 const TERMINAL: ReadonlySet<TaskState> = new Set(['completed', 'failed', 'canceled'])
@@ -254,15 +256,23 @@ export class Store {
   }
 
   /**
-   * Claims the task that has been ready longest in `queue` (or under it, when `queue` ends with "/")
-   * that has every label in `labels`. Returns null when none is ready.
+   * Claims a ready task by ID or the task that has been ready longest in `queue` (or under it,
+   * when `queue` ends with "/") that has every label in `labels`. Returns null when none is ready.
    */
-  claim(filter: { queue: string; labels?: Labels; leaseMs?: number }, who: Writer): Task | null {
-    need(isName(filter.queue), 'queue must be a non-empty string')
-    need(filter.labels === undefined || isLabels(filter.labels), 'labels must map strings to strings')
+  claim(filter: ClaimFilter, who: Writer): Task | null {
     const leaseMs = checkLease(filter.leaseMs)
-    return this.#write('claim', null, { queue: filter.queue, labels: sortedLabels(filter.labels), leaseMs }, who, (now) => {
-      const row = this.#rows('ready', filter.queue, 'ready_at, id').find((candidate) => hasLabels(candidate, filter.labels))
+    const { id, queue, labels } = filter
+    if (id === undefined) {
+      need(isName(queue), 'queue must be a non-empty string')
+      need(labels === undefined || isLabels(labels), 'labels must map strings to strings')
+    } else {
+      need(Number.isSafeInteger(id) && id > 0 && queue === undefined && labels === undefined, 'use a positive id without queue or labels')
+    }
+    const args = id === undefined ? { queue, labels: sortedLabels(labels), leaseMs } : { leaseMs }
+    return this.#write('claim', id ?? null, args, who, (now) => {
+      const row = id === undefined
+        ? this.#rows('ready', queue, 'ready_at, id').find((candidate) => hasLabels(candidate, labels))
+        : this.#get("SELECT * FROM tasks WHERE id = ? AND state = 'ready'", id)
       if (!row) return null
       return toTask(
         this.#move(row, 'task.claimed', 'claimed', who, now, {
@@ -344,18 +354,21 @@ export class Store {
   }
 
   /** Stores `value` under `key` on the task unless the key has one. Returns the stored value. */
-  memo(id: number, key: string, value: unknown, who: { actor: string }): unknown {
+  memo(id: number, key: string, value: unknown, who: Writer): unknown {
     need(isName(key), 'key must be a non-empty string')
-    need(value !== undefined, 'value is required')
-    checkActor(who)
-    return this.#run((now) => {
+    const encoded = JSON.stringify(value, (_key, item: unknown) =>
+      item && typeof item === 'object' && !Array.isArray(item) ? sortedEntries(item) : item,
+    )
+    need(encoded !== undefined, 'value must be JSON')
+    return this.#write('memo', id, { key, value: encoded }, who, (now) => {
       const row = this.#row(id)
       const stored = this.#db.prepare('SELECT value FROM memos WHERE task_id = ? AND key = ?').get(id, key) as { value: string } | undefined
-      if (stored) return JSON.parse(stored.value) as unknown
-      this.#db.prepare('INSERT INTO memos (task_id, key, value, actor, at) VALUES (?, ?, ?, ?, ?)').run(id, key, JSON.stringify(value), who.actor, now)
-      this.#event(id, 'task.memo', who, row.state, row.state, { key, value }, now)
-      return value
-    })
+      if (stored) return { value: JSON.parse(stored.value) as unknown }
+      const parsed: unknown = JSON.parse(encoded)
+      this.#db.prepare('INSERT INTO memos (task_id, key, value, actor, at) VALUES (?, ?, ?, ?, ?)').run(id, key, encoded, who.actor, now)
+      this.#event(id, 'task.memo', who, row.state, row.state, { key, value: parsed }, now)
+      return { value: parsed }
+    }).value
   }
 
   /** Returns a task's immutable queue for authorization without reading or expiring its claim. */
@@ -385,11 +398,11 @@ export class Store {
   /** Events with `seq > after`, in order. Sequence numbers have no gaps. */
   events(options: { after?: number; limit?: number } = {}): TaskEvent[] {
     const after = options.after ?? 0
-    const limit = options.limit ?? 100
-    need(Number.isInteger(after) && after >= 0, 'after must be a non-negative integer')
-    need(Number.isInteger(limit) && limit >= 1 && limit <= 1000, 'limit must be an integer from 1 to 1000')
+    const { limit } = options
+    need(Number.isSafeInteger(after) && after >= 0, 'after must be a non-negative safe integer')
+    need(limit === undefined || (Number.isInteger(limit) && limit >= 1 && limit <= 1000), 'limit must be an integer from 1 to 1000')
     return this.#run(() =>
-      (this.#db.prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?').all(after, limit) as unknown as EventRow[]).map(toEvent),
+      (this.#db.prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?').all(after, limit ?? -1) as unknown as EventRow[]).map(toEvent),
     )
   }
 
@@ -583,8 +596,12 @@ function hasLabels(row: Row, wanted: Labels | undefined): boolean {
   return Object.entries(wanted).every(([key, value]) => labels[key] === value)
 }
 
+function sortedEntries(object: object) {
+  return Object.fromEntries(Object.entries(object).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+}
+
 function sortedLabels(labels: Labels | undefined): Labels | null {
-  return labels ? Object.fromEntries(Object.entries(labels).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : null
+  return labels ? sortedEntries(labels) : null
 }
 
 function checkLease(leaseMs: number | undefined): number {
