@@ -593,14 +593,37 @@ test('HTTP notes, memos and admin writes enforce their own scopes and survive re
 const primarySecret = 'fixture primary secret'
 const secondarySecret = 'fixture secondary secret'
 
-function pagerDutyDelivery(hub: ReturnType<typeof client>, source: string, type: 'triggered' | 'resolved', secret: string, at = now) {
-  const body = JSON.stringify({ event: {
-    id: `delivery-${type}`, event_type: `incident.${type}`, occurred_at: new Date(at).toISOString(),
+const signatureHeaders = {
+  pagerduty: ['X-PagerDuty-Signature', 'v1='],
+  github: ['X-Hub-Signature-256', 'sha256='],
+  generic: ['X-Pullcord-Signature', 'sha256='],
+}
+
+function signedDelivery(
+  hub: ReturnType<typeof client>,
+  source: string,
+  provider: keyof typeof signatureHeaders,
+  secret: string,
+  body: string,
+  headers: Record<string, string> = {},
+) {
+  const digest = createHmac('sha256', secret).update(body).digest('hex')
+  const [header, prefix] = signatureHeaders[provider]
+  return hub.request(`/ingest/${source}`, undefined, { method: 'POST', body, headers: { ...headers, [header]: prefix + digest } })
+}
+
+function pagerDutyDelivery(
+  hub: ReturnType<typeof client>,
+  source: string,
+  type: 'triggered' | 'resolved',
+  secret: string,
+  at = now,
+  id = `delivery-${type}`,
+) {
+  return signedDelivery(hub, source, 'pagerduty', secret, JSON.stringify({ event: {
+    id, event_type: `incident.${type}`, occurred_at: new Date(at).toISOString(),
     data: { id: 'PGR0VU2', title: 'Source title', queue: 'producer-queue', retry: 'manual' },
-  } }, null, 2)
-  return hub.request(`/ingest/${source}`, undefined, {
-    method: 'POST', body, headers: { 'X-PagerDuty-Signature': `v1=${createHmac('sha256', secret).update(body).digest('hex')}` },
-  })
+  } }, null, 2))
 }
 
 test('signed webhook retries survive restart and resolution fences only the matching source task', { timeout: 15_000 }, async (t) => {
@@ -638,15 +661,54 @@ test('signed webhook retries survive restart and resolution fences only the matc
   assert.equal((await pagerDutyDelivery(restarted, 'secondary', 'triggered', secondarySecret)).status, 202)
   const claim = await ok(await restarted.post(claimPath, agentA, { id: task.id, request_id: 'held' }))
   await error(await pagerDutyDelivery(restarted, 'pagerduty', 'resolved', secondarySecret), 401, 'unauthorized')
+  assert.equal((await pagerDutyDelivery(restarted, 'secondary', 'resolved', secondarySecret)).status, 202)
+  const afterSecondary = await ok(await restarted.get('/tasks', watcher))
+  assert.deepEqual(afterSecondary.tasks.map(({ state }: { state: string }) => state), ['claimed', 'canceled'])
+  assert.equal(afterSecondary.tasks[0].holder, claim.holder)
+  assert.equal(afterSecondary.tasks[0].epoch, claim.epoch)
+
   const canceled = await Promise.all(Array.from({ length: 3 }, () => pagerDutyDelivery(restarted, 'pagerduty', 'resolved', primarySecret)))
   for (const response of canceled) assert.equal(response.status, 202)
+  assert.equal((await pagerDutyDelivery(restarted, 'pagerduty', 'resolved', primarySecret, now, 'another-resolution')).status, 202)
   await error(await restarted.post(`/tasks/${task.id}/complete`, agentA, { request_id: 'stale', epoch: claim.epoch }), 409, 'claim_lost')
   const snapshot = await ok(await restarted.get('/tasks', watcher))
-  assert.deepEqual(snapshot.tasks.map(({ state }: { state: string }) => state), ['canceled', 'ready'])
+  assert.deepEqual(snapshot.tasks.map(({ state }: { state: string }) => state), ['canceled', 'canceled'])
   const { events } = await ok(await restarted.get('/events?after=1', watcher))
   assert.deepEqual(events.map(({ type, actor, request_id }: { type: string; actor: string; request_id: string }) => [type, actor, request_id]), [
-    ['task.created', 'source:secondary', null], ['task.claimed', 'agent:a', 'held'], ['task.canceled', 'source:pagerduty', 'delivery-resolved'],
+    ['task.created', 'source:secondary', null], ['task.claimed', 'agent:a', 'held'],
+    ['task.canceled', 'source:secondary', 'delivery-resolved'], ['task.canceled', 'source:pagerduty', 'delivery-resolved'],
   ])
+})
+
+test('signed ignored notifications are acknowledged even outside the actionable freshness window', { timeout: 10_000 }, async (t) => {
+  const db = join(dir, 'ingest-ignore.db')
+  const keys = join(dir, 'ingest-ignore-keys.json')
+  const sources = join(dir, 'ingest-ignore-sources.json')
+  writeFileSync(keys, JSON.stringify([credential('watcher', watcher, ['*'], ['read', 'events'])]))
+  writeFileSync(sources, JSON.stringify([
+    { name: 'pagerduty', provider: 'pagerduty', queue: checkoutQueue, secret: primarySecret },
+    { name: 'github', provider: 'github', queue: checkoutQueue, secret: secondarySecret },
+  ]), { mode: 0o600 })
+  const hub = await start(db, keys, now, sources)
+  t.after(() => hub.stop())
+  const stale = new Date(now - 300_001).toISOString()
+  const ping = JSON.stringify({ event: { event_type: 'pagey.ping', occurred_at: stale } })
+  const workflow = (conclusion: string) => JSON.stringify({
+    action: 'completed',
+    workflow_run: { id: 1, name: 'CI', status: 'completed', conclusion, updated_at: stale },
+  })
+  const githubHeaders = { 'X-GitHub-Event': 'workflow_run' }
+  for (const response of await Promise.all([
+    signedDelivery(hub, 'pagerduty', 'pagerduty', primarySecret, ping),
+    signedDelivery(hub, 'github', 'github', secondarySecret, workflow('success'), githubHeaders),
+  ])) {
+    assert.equal(response.status, 202)
+    assert.deepEqual(await response.json(), {})
+  }
+  await error(await signedDelivery(hub, 'pagerduty', 'pagerduty', 'wrong-secret', ping), 401, 'unauthorized')
+  await error(await pagerDutyDelivery(hub, 'pagerduty', 'resolved', primarySecret, now - 300_001), 401, 'unauthorized')
+  await error(await signedDelivery(hub, 'github', 'github', secondarySecret, workflow('failure'), githubHeaders), 401, 'unauthorized')
+  assert.deepEqual(await ok(await hub.get('/tasks', watcher)), { tasks: [], cursor: 0 })
 })
 
 test('ingest bounds chunked bodies and rate-limits verified deliveries per configured name', { timeout: 10_000 }, async (t) => {
@@ -665,17 +727,16 @@ test('ingest bounds chunked bodies and rate-limits verified deliveries per confi
   await error(await hub.post('/ingest/unknown', watcher, {}), 404, 'not_found')
   await error(await hub.post('/ingest/generic', watcher, {}), 401, 'unauthorized')
 
-  const send = (source: string, secret: string, dedupe_key = 'limit-test') => {
-    const body = JSON.stringify({ timestamp: Date.now(), dedupe_key, title: 'Fixture' })
-    return hub.request(`/ingest/${source}`, undefined, {
-      method: 'POST', body, headers: { 'X-Pullcord-Signature': `sha256=${createHmac('sha256', secret).update(body).digest('hex')}` },
-    })
-  }
-  for (let i = 0; i < 120; i++) {
+  const send = (source: string, secret: string, dedupe_key = 'limit-test', timestamp = Date.now()) =>
+    signedDelivery(hub, source, 'generic', secret, JSON.stringify({ timestamp, dedupe_key, title: 'Fixture' }))
+  await error(await signedDelivery(hub, 'generic', 'generic', primarySecret, '{'), 400, 'invalid_argument')
+  await error(await send('generic', primarySecret, 'stale', Date.now() - 600_000), 401, 'unauthorized')
+  for (let i = 0; i < 118; i++) {
     const response = await send('generic', primarySecret)
     assert.equal(response.status, 202, `delivery ${i + 1}`)
     await response.text()
   }
+  await error(await signedDelivery(hub, 'generic', 'generic', primarySecret, '{'), 429, 'rate_limited')
   await error(await send('generic', primarySecret, 'would-be-new'), 429, 'rate_limited')
   assert.equal((await send('second', secondarySecret)).status, 202)
   const { tasks, cursor } = await ok(await hub.get('/tasks', watcher))

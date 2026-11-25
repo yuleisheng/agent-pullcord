@@ -22,36 +22,27 @@ const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\
 const encoder = new TextEncoder()
 const decoder = new TextDecoder('utf-8', { fatal: true })
 
-async function hasValidSignature(
+export async function verifySignature(
   secret: string,
   signatures: string[],
   prefix: string,
   bytes: Uint8Array<ArrayBuffer>,
-): Promise<boolean> {
+): Promise<void> {
   const digests = signatures.map((value) => value.trim())
     .filter((value) => value.startsWith(prefix))
     .map((value) => value.slice(prefix.length))
     .filter((hex) => /^[a-f\d]{64}$/i.test(hex))
-  if (!digests.length) return false
-
-  const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'])
-  for (const hex of digests) {
-    const signature = Uint8Array.from({ length: 32 }, (_, index) => Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16))
-    if (await crypto.subtle.verify('HMAC', key, signature, bytes)) return true
+  if (digests.length) {
+    const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'])
+    for (const hex of digests) {
+      const signature = Uint8Array.from({ length: 32 }, (_, index) => Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16))
+      if (await crypto.subtle.verify('HMAC', key, signature, bytes)) return
+    }
   }
-  return false
+  throw new SourceError('unauthorized', 'Send a valid signature for this source and request body.')
 }
 
-export async function signedBody(
-  secret: string,
-  signatures: string[],
-  prefix: string,
-  bytes: Uint8Array<ArrayBuffer>,
-): Promise<Record<string, unknown>> {
-  if (!(await hasValidSignature(secret, signatures, prefix, bytes))) {
-    throw new SourceError('unauthorized', 'Send a valid signature for this source and request body.')
-  }
-
+export function decodeSourceBody(bytes: Uint8Array<ArrayBuffer>): Record<string, unknown> {
   let payload: unknown
   try {
     payload = JSON.parse(decoder.decode(bytes))

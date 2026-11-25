@@ -1,5 +1,5 @@
 import { HOLDER_ACTIONS, parseKeyConfig, parseSourceConfig, type Action } from './config.ts'
-import { readSourceEvent, SourceError } from './sources/index.ts'
+import { SourceError, verifySourceDelivery } from './sources/index.ts'
 import { MAX_LEASE_MS, MIN_LEASE_MS, StoreError, type ErrorCode } from './store-contract.ts'
 import type { Labels, Store, Task, TaskEvent, TaskState, Writer } from './store.ts'
 
@@ -338,8 +338,7 @@ function createIngest(store: TaskStore, config: unknown) {
     const source = sources.get(name)
     if (!source) throw new ApiError(404, 'not_found', 'Use the webhook URL for a configured source.')
     const raw = await readBody(request, MAX_INGEST_BYTES)
-    const event = await readSourceEvent(source.provider, source.secret, request.headers, raw, Date.now())
-    request.signal.throwIfAborted()
+    const readEvent = await verifySourceDelivery(source.provider, source.secret, request.headers, raw)
     const time = performance.now()
     if (time >= source.until) {
       source.until = time + INGEST_WINDOW_MS
@@ -347,6 +346,8 @@ function createIngest(store: TaskStore, config: unknown) {
     }
     if (source.used >= INGEST_WINDOW_LIMIT) throw new ApiError(429, 'rate_limited', 'This source reached its delivery limit. Retry in a minute.')
     source.used++
+    request.signal.throwIfAborted()
+    const event = readEvent(Date.now())
     const actor = `source:${name}`
     if (event.action === 'create') {
       store.ingest({ ...event.task, source: name, queue: source.queue, retry: source.retry }, { actor })

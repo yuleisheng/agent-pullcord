@@ -186,7 +186,7 @@ Webhooks need a public HTTPS address. v1 documents running the hub behind a reve
 - **Who can create tasks.** Only verified sources and admin keys. Whoever creates tasks steers the agents.
 - **Agent keys.** Each key belongs to one agent, is limited to its queues and actions, is stored hashed, can be revoked, and is shown only once. Until key management ships, `serve` loads `{ agent, sha256, queues, can }` entries from a JSON file at startup. Keys are 32 random bytes encoded as hex, with only the SHA-256 digest of that hex string in the file. Queue grants are exact names, slash-terminated prefixes, or `*` for every queue. Removing an entry revokes its key only after `serve` restarts. Keep the agent name stable when rotating its key.
 - **Untrusted payloads.** Task titles and payloads come from outside. The API and MCP tools return them in fields marked untrusted, separate from fields the hub sets. Agents must not follow instructions found in them.
-- **Rate limits and audit.** An ingest body is limited to 1 MiB. Each configured source may send 120 verified deliveries per minute in a process-local window; further deliveries receive `429 rate_limited`. The event log is append-only.
+- **Rate limits and audit.** An ingest body is limited to 1 MiB. Each configured source may send 120 deliveries with valid signatures per minute in a process-local window. The limit applies before parsing or freshness checks. Further verified deliveries receive `429 rate_limited`. The event log is append-only.
 - **Limit.** The hub can't make agents safe. A crafted alert is a path for prompt injection into agents that have production access. Whatever an agent's own credentials allow is the real security boundary.
 
 ## Acceptance checks
