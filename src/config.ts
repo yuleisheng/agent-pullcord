@@ -26,6 +26,14 @@ export interface SourceConfig {
 
 const CONFIG_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
 
+export function parsePublicUrl(value: string): URL {
+  const url = URL.parse(value)
+  if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password || url.search || url.hash) {
+    throw new Error('Use an absolute HTTP(S) URL without credentials, a query, or a fragment.')
+  }
+  return url
+}
+
 export function parseKeyConfig(config: unknown): KeyConfig[] {
   if (!Array.isArray(config)) throw new Error('The key file must contain a JSON array.')
   const agents = new Set<string>()

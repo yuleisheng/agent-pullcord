@@ -1,14 +1,24 @@
 import { readFileSync } from 'node:fs'
 import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { Readable } from 'node:stream'
 import { parseArgs } from 'node:util'
 import { createApi } from './api.ts'
-import { DEFAULT_DB, DEFAULT_KEYS, DEFAULT_SOURCES } from './config.ts'
+import { DEFAULT_DB, DEFAULT_KEYS, DEFAULT_SOURCES, parsePublicUrl } from './config.ts'
 import { openStore, type Store } from './store.ts'
 
-export function createHttpServer(store: Store, keys: unknown, sources: unknown = []) {
-  const api = createApi(store, keys, sources)
-  return createServer({ requestTimeout: 30_000 }, async (req, res) => {
+function boundUrl(bound: AddressInfo | string | null): string | undefined {
+  if (!bound || typeof bound === 'string') return undefined
+  const address = bound.family === 'IPv6' ? `[${bound.address}]` : bound.address
+  return `http://${address}:${bound.port}`
+}
+
+export function createHttpServer(store: Store, keys: unknown, sources: unknown = [], publicUrl?: URL) {
+  const api = createApi(store, keys, sources, (origin) => {
+    const local = boundUrl(server.address())
+    return origin === publicUrl?.origin || (local !== undefined && origin === new URL(local).origin)
+  })
+  const server = createServer({ requestTimeout: 30_000 }, async (req, res) => {
     try {
       const target = req.url?.startsWith('/') ? req.url : '/'
       const abort = new AbortController()
@@ -30,6 +40,7 @@ export function createHttpServer(store: Store, keys: unknown, sources: unknown =
       res.destroy()
     }
   })
+  return server
 }
 
 function readConfig(path: string, kind: 'key' | 'source', optional = false): unknown {
@@ -68,6 +79,7 @@ export function serve(args: string[]): void {
       keys: { type: 'string', default: DEFAULT_KEYS },
       sources: { type: 'string' },
       listen: { type: 'string', default: '127.0.0.1:7337' },
+      'public-url': { type: 'string' },
       json: { type: 'boolean' },
     },
   })
@@ -75,12 +87,13 @@ export function serve(args: string[]): void {
   if (!addr || Number(addr[3]) > 65535) throw new Error('Pass --listen as host:port (use [address]:port for IPv6).')
   const host = addr[1] ?? addr[2]
   const port = Number(addr[3])
+  const publicUrl = values['public-url'] === undefined ? undefined : parsePublicUrl(values['public-url'])
   const keys = readConfig(values.keys, 'key')
   const sources = readConfig(values.sources ?? DEFAULT_SOURCES, 'source', values.sources === undefined)
   const store = openHubStore(values.db)
   let server: ReturnType<typeof createHttpServer>
   try {
-    server = createHttpServer(store, keys, sources)
+    server = createHttpServer(store, keys, sources, publicUrl)
   } catch (error) {
     store.close()
     throw error
@@ -92,12 +105,8 @@ export function serve(args: string[]): void {
   })
   server.once('close', () => store.close())
   server.listen(port, host, () => {
-    const bound = server.address()
-    if (bound && typeof bound !== 'string') {
-      const address = bound.family === 'IPv6' ? `[${bound.address}]` : bound.address
-      const url = `http://${address}:${bound.port}`
-      console.log(values.json ? JSON.stringify({ url }) : `Listening on ${url}`)
-    }
+    const url = boundUrl(server.address())
+    if (url) console.log(values.json ? JSON.stringify({ url }) : `Listening on ${url}`)
   })
 }
 

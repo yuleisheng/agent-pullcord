@@ -1,4 +1,5 @@
 import { HOLDER_ACTIONS, parseKeyConfig, parseSourceConfig, type Action } from './config.ts'
+import { createMcp } from './mcp.ts'
 import { SourceError, verifySourceDelivery } from './sources/index.ts'
 import { MAX_LEASE_MS, MIN_LEASE_MS, StoreError, type ErrorCode } from './store-contract.ts'
 import type { Labels, Store, Task, TaskEvent, TaskState, Writer } from './store.ts'
@@ -147,15 +148,24 @@ async function readBody(request: Request, limit: number): Promise<Uint8Array<Arr
   return raw
 }
 
-async function jsonBody(request: Request): Promise<Record<string, unknown>> {
+async function readJson(request: Request): Promise<unknown> {
   if (request.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() !== 'application/json') {
     throw new ApiError(415, 'invalid_argument', 'Send Content-Type: application/json.')
   }
   const raw = await readBody(request, MAX_BODY_BYTES)
+  try {
+    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw))
+  } catch {
+    throw new SyntaxError('Send valid UTF-8 JSON in the request body.')
+  }
+}
+
+async function jsonBody(request: Request): Promise<Record<string, unknown>> {
   let body: unknown
   try {
-    body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw))
-  } catch {
+    body = await readJson(request)
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error
     invalid('Send a valid UTF-8 JSON object in the request body.')
   }
   if (!isObject(body)) invalid('Send a JSON object in the request body.')
@@ -358,14 +368,21 @@ function createIngest(store: TaskStore, config: unknown) {
   }
 }
 
-export function createApi(store: TaskStore, config: unknown, sources: unknown = []): (request: Request) => Promise<Response> {
+export function createApi(store: TaskStore, config: unknown, sources: unknown = [], allowsMcpOrigin?: (origin: string) => boolean) {
   const keys = keyring(config)
   const ingest = createIngest(store, sources)
-  return async (request) => {
+  const mcp = createMcp(readJson)
+  const handle = async (request: Request): Promise<Response> => {
     try {
       const { pathname, searchParams } = new URL(request.url)
       const webhook = /^\/ingest\/([^/]+)$/.exec(pathname)
       if (request.method === 'POST' && webhook) return await ingest(request, webhook[1])
+      if (pathname === '/mcp') {
+        const origin = request.headers.get('origin')
+        if (origin !== null && !allowsMcpOrigin?.(origin)) throw new ApiError(403, 'forbidden', 'Use the hub’s bound origin or configured public origin.')
+        const agent = await authenticate(request, keys)
+        return await mcp(request, agent.actor, handle)
+      }
       const agent = await authenticate(request, keys)
       const task = /^\/tasks\/([^/]+)$/.exec(pathname)
       if (request.method === 'GET' && pathname === '/tasks') {
@@ -408,4 +425,5 @@ export function createApi(store: TaskStore, config: unknown, sources: unknown = 
       return json({ code: 'internal_error', message: 'The hub could not handle the request. Try again or contact its operator.' }, 500)
     }
   }
+  return handle
 }
