@@ -351,6 +351,6 @@ test('the installed CLI takes a new hub from init to its first claimed task and 
   }
   const issue = await call(2, 'claim', { queue: 'demo/github' })
   assert.deepEqual([issue.state, issue.dedupe_key], ['claimed', 'issue:109'])
-  assert.equal((await call(3, 'complete', { id: issue.id })).state, 'completed')
+  assert.equal((await call(3, 'complete', { id: issue.id, epoch: issue.epoch })).state, 'completed')
   assert.deepEqual((await ok<{ tasks: WireTask[] }>(await hub.get('/tasks', admin_key))).tasks.map(({ state }) => state), ['completed', 'completed'])
 })
