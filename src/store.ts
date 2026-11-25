@@ -1,9 +1,5 @@
 import { DatabaseSync } from 'node:sqlite'
 
-// The task store: tasks, their lifecycle, and the event log, in one SQLite file
-// owned by one process. docs/PRD.md is the spec; this file implements its
-// "Task lifecycle" table and "Invariants".
-
 export type TaskState = 'ready' | 'claimed' | 'blocked' | 'interrupted' | 'completed' | 'failed' | 'canceled'
 export type Retry = 'safe' | 'manual'
 export type Labels = Record<string, string>
@@ -60,7 +56,7 @@ export interface IngestInput {
   labels?: Labels
   sourceUrl?: string
   adapter?: string
-  /** Default `manual`: a task whose agent vanished is not retried without a person. */
+  /** Default `manual`. */
   retry?: Retry
   /** Default 3. */
   maxAttempts?: number
@@ -152,12 +148,12 @@ CREATE TABLE IF NOT EXISTS memos (
 CREATE TABLE IF NOT EXISTS requests (
   actor TEXT NOT NULL,
   request_id TEXT NOT NULL,
-  op TEXT NOT NULL,
-  task_id INTEGER,
+  write TEXT NOT NULL,
   response TEXT NOT NULL,
   at INTEGER NOT NULL,
   PRIMARY KEY (actor, request_id)
 );
+PRAGMA user_version = 1;
 `
 
 interface Row {
@@ -277,7 +273,7 @@ export class Store {
     need(isName(filter.queue), 'queue must be a non-empty string')
     need(filter.labels === undefined || isLabels(filter.labels), 'labels must map strings to strings')
     const leaseMs = checkLease(filter.leaseMs)
-    return this.#write('claim', null, who, (now) => {
+    return this.#write('claim', null, { queue: filter.queue, labels: sortedLabels(filter.labels), leaseMs }, who, (now) => {
       const row = this.#rows('ready', filter.queue).find((candidate) => hasLabels(candidate, filter.labels))
       if (!row) return null
       return toTask(
@@ -295,7 +291,7 @@ export class Store {
   /** Extends the holder's lease to `leaseMs` from now. */
   renew(id: number, who: Holder & { leaseMs?: number }): Task {
     const leaseMs = checkLease(who.leaseMs)
-    return this.#write('renew', id, who, (now) => {
+    return this.#write('renew', id, { epoch: who.epoch, leaseMs }, who, (now) => {
       const row = this.#held(id, who)
       return toTask(this.#move(row, 'task.renewed', 'claimed', who, now, { lease_expires_at: now + leaseMs }))
     })
@@ -303,62 +299,62 @@ export class Store {
 
   complete(id: number, who: Holder & { result?: string }): Task {
     need(who.result === undefined || typeof who.result === 'string', 'result must be a string')
-    return this.#write('complete', id, who, (now) => {
+    return this.#write('complete', id, { epoch: who.epoch, result: who.result ?? null }, who, (now) => {
       const row = this.#held(id, who)
-      return toTask(this.#end(row, 'task.completed', 'completed', who, now, { result: who.result ?? null }))
+      return toTask(this.#moveAndClearClaim(row, 'task.completed', 'completed', who, now, { result: who.result ?? null }))
     })
   }
 
   /** Ends the claim as a failure. With `retry`, the task is ready again while it has attempts left. */
   fail(id: number, who: Holder & { reason: string; retry?: boolean }): Task {
     need(isName(who.reason), 'reason must be a non-empty string')
-    return this.#write('fail', id, who, (now) => {
+    return this.#write('fail', id, { epoch: who.epoch, reason: who.reason, retry: who.retry === true }, who, (now) => {
       const row = this.#held(id, who)
       const to = who.retry === true && row.attempts < row.max_attempts ? 'ready' : 'failed'
-      return toTask(this.#end(row, 'task.failed', to, who, now, { reason: who.reason }))
+      return toTask(this.#moveAndClearClaim(row, 'task.failed', to, who, now, { reason: who.reason }))
     })
   }
 
   /** Hands the task back, ready again. The attempt is given back too. */
   release(id: number, who: Holder): Task {
-    return this.#write('release', id, who, (now) => {
+    return this.#write('release', id, { epoch: who.epoch }, who, (now) => {
       const row = this.#held(id, who)
-      return toTask(this.#end(row, 'task.released', 'ready', who, now, { attempts: row.attempts - 1 }))
+      return toTask(this.#moveAndClearClaim(row, 'task.released', 'ready', who, now, { attempts: row.attempts - 1 }))
     })
   }
 
   /** Holds the task for a person, ending the claim. The attempt is given back. */
   block(id: number, who: Holder & { reason: string }): Task {
     need(isName(who.reason), 'reason must be a non-empty string')
-    return this.#write('block', id, who, (now) => {
+    return this.#write('block', id, { epoch: who.epoch, reason: who.reason }, who, (now) => {
       const row = this.#held(id, who)
-      return toTask(this.#end(row, 'task.blocked', 'blocked', who, now, { attempts: row.attempts - 1, reason: who.reason }))
+      return toTask(this.#moveAndClearClaim(row, 'task.blocked', 'blocked', who, now, { attempts: row.attempts - 1, reason: who.reason }))
     })
   }
 
   unblock(id: number, who: Writer): Task {
-    return this.#write('unblock', id, who, (now) => toTask(this.#reopen(id, 'blocked', 'task.unblocked', who, now)))
+    return this.#write('unblock', id, {}, who, (now) => toTask(this.#reopen(id, 'blocked', 'task.unblocked', who, now)))
   }
 
   requeue(id: number, who: Writer): Task {
-    return this.#write('requeue', id, who, (now) => toTask(this.#reopen(id, 'interrupted', 'task.requeued', who, now)))
+    return this.#write('requeue', id, {}, who, (now) => toTask(this.#reopen(id, 'interrupted', 'task.requeued', who, now)))
   }
 
   cancel(id: number, who: Writer & { reason: string }): Task {
     need(isName(who.reason), 'reason must be a non-empty string')
-    return this.#write('cancel', id, who, (now) => {
+    return this.#write('cancel', id, { reason: who.reason }, who, (now) => {
       const row = this.#row(id)
       if (TERMINAL.has(row.state)) {
         throw new StoreError('invalid_transition', `Task ${id} is already ${row.state}. Finished tasks can't be canceled.`)
       }
-      return toTask(this.#end(row, 'task.canceled', 'canceled', who, now, { reason: who.reason }))
+      return toTask(this.#moveAndClearClaim(row, 'task.canceled', 'canceled', who, now, { reason: who.reason }))
     })
   }
 
   /** Appends a note to the task's log. Changes no state. */
   log(id: number, who: Writer & { text: string }): TaskEvent {
     need(typeof who.text === 'string' && who.text.length > 0, 'text must be a non-empty string')
-    return this.#write('log', id, who, (now) => {
+    return this.#write('log', id, { text: who.text }, who, (now) => {
       const row = this.#row(id)
       return this.#event(row.id, 'task.logged', who, row.state, row.state, { text: who.text }, now)
     })
@@ -412,9 +408,6 @@ export class Store {
     )
   }
 
-  // Every operation runs in one transaction that first records leases that ran out
-  // (PRD D4), so correctness never depends on a timer. A failed operation keeps
-  // those expiries and undoes only its own changes.
   #run<T>(fn: (now: number) => T): T {
     const now = this.#clock()
     this.#db.exec('BEGIN IMMEDIATE')
@@ -439,18 +432,17 @@ export class Store {
     }
   }
 
-  // A write with a request ID returns its first successful result when repeated (PRD D6).
-  // Failures and empty claims aren't recorded, so a retry of one runs again.
-  #write<T>(op: string, taskId: number | null, who: Writer, fn: (now: number) => T): T {
+  #write<T>(op: string, taskId: number | null, args: Record<string, unknown>, who: Writer, fn: (now: number) => T): T {
     checkActor(who)
     need(who.requestId === undefined || isName(who.requestId), 'requestId must be a non-empty string')
+    const write = JSON.stringify({ op, taskId, ...args })
     return this.#run((now) => {
       if (who.requestId !== undefined) {
         const prior = this.#db
-          .prepare('SELECT op, task_id, response FROM requests WHERE actor = ? AND request_id = ?')
-          .get(who.actor, who.requestId) as { op: string; task_id: number | null; response: string } | undefined
+          .prepare('SELECT write, response FROM requests WHERE actor = ? AND request_id = ?')
+          .get(who.actor, who.requestId) as { write: string; response: string } | undefined
         if (prior) {
-          if (prior.op !== op || prior.task_id !== taskId) {
+          if (prior.write !== write) {
             throw new StoreError('request_id_reused', `Request ID ${who.requestId} was already used for another write. Use a new request ID.`)
           }
           return JSON.parse(prior.response) as T
@@ -459,8 +451,8 @@ export class Store {
       const result = fn(now)
       if (who.requestId !== undefined && result !== null) {
         this.#db
-          .prepare('INSERT INTO requests (actor, request_id, op, task_id, response, at) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(who.actor, who.requestId, op, taskId, JSON.stringify(result), now)
+          .prepare('INSERT INTO requests (actor, request_id, write, response, at) VALUES (?, ?, ?, ?, ?)')
+          .run(who.actor, who.requestId, write, JSON.stringify(result), now)
       }
       return result
     })
@@ -469,15 +461,12 @@ export class Store {
   #expireLeases(now: number): void {
     const expired = this.#all("SELECT * FROM tasks WHERE state = 'claimed' AND lease_expires_at <= ? ORDER BY id", now)
     for (const row of expired) {
-      // An attempt that ran out ends the task. Otherwise only a task that is safe to
-      // rerun goes back to ready; a manual one waits for a person (PRD D5).
       const to: TaskState = row.attempts >= row.max_attempts ? 'failed' : row.retry === 'safe' ? 'ready' : 'interrupted'
       const reason = to === 'ready' ? null : `lease held by ${row.holder} expired`
-      this.#end(row, 'task.lease_expired', to, HUB, now, { reason }, { holder: row.holder, epoch: row.epoch })
+      this.#moveAndClearClaim(row, 'task.lease_expired', to, HUB, now, { reason }, { holder: row.holder, epoch: row.epoch })
     }
   }
 
-  /** The task's row when `who` holds its current claim; otherwise `claim_lost`, changing nothing. */
   #held(id: number, who: Holder): Row {
     need(Number.isInteger(who.epoch), 'epoch must be an integer')
     const row = this.#row(id)
@@ -493,8 +482,7 @@ export class Store {
     return this.#move(row, type, 'ready', who, now, { reason: null })
   }
 
-  /** Moves a task out of `claimed` (or any state, for cancel), clearing the claim. */
-  #end(row: Row, type: string, to: TaskState, who: Writer, now: number, set: Partial<Row>, data?: unknown): Row {
+  #moveAndClearClaim(row: Row, type: string, to: TaskState, who: Writer, now: number, set: Partial<Row>, data?: unknown): Row {
     return this.#move(row, type, to, who, now, { holder: null, lease_expires_at: null, ...set }, data)
   }
 
@@ -528,9 +516,8 @@ export class Store {
       params.push(state)
     }
     if (queue !== undefined) {
-      // "incidents/" matches every queue under incidents/; anything else matches exactly.
-      where.push(queue.endsWith('/') ? 'substr(queue, 1, ?) = ?' : 'queue = ?')
-      params.push(...(queue.endsWith('/') ? [queue.length, queue] : [queue]))
+      where.push(queue.endsWith('/') ? 'substr(queue, 1, length(?)) = ?' : 'queue = ?')
+      params.push(...(queue.endsWith('/') ? [queue, queue] : [queue]))
     }
     return this.#all(`SELECT * FROM tasks ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY id`, ...params)
   }
@@ -612,6 +599,10 @@ function hasLabels(row: Row, wanted: Labels | undefined): boolean {
   if (!wanted) return true
   const labels = JSON.parse(row.labels) as Labels
   return Object.entries(wanted).every(([key, value]) => labels[key] === value)
+}
+
+function sortedLabels(labels: Labels | undefined): Labels | null {
+  return labels ? Object.fromEntries(Object.entries(labels).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : null
 }
 
 function checkLease(leaseMs: number | undefined): number {

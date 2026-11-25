@@ -6,11 +6,6 @@ import { after, test } from 'node:test'
 import fc from 'fast-check'
 import { openStore, StoreError, type Store, type Task, type TaskEvent, type TaskState } from '../src/store.ts'
 
-// Random sequences of operations from three agents, run against the store and against a
-// model written from the lifecycle table in docs/PRD.md. After every step the two must
-// agree, and the invariants must hold. A failure prints a seed and a shrunk sequence:
-// keep it as a regression case.
-
 const dir = mkdtempSync(join(tmpdir(), 'pullcord-lifecycle-'))
 after(() => rmSync(dir, { recursive: true, force: true }))
 
@@ -26,6 +21,7 @@ type Op =
   | { t: 'unblock' | 'requeue' | 'cancel'; key: number }
   | { t: 'advance'; ms: number }
   | { t: 'repeat' }
+  | { t: 'reuse' }
 
 const agent = fc.integer({ min: 0, max: AGENTS.length - 1 })
 const key = fc.integer({ min: 0, max: KEYS - 1 })
@@ -41,11 +37,11 @@ const op: fc.Arbitrary<Op> = fc.oneof(
   fc.record({ t: fc.constantFrom('unblock' as const, 'requeue' as const, 'cancel' as const), key }),
   { arbitrary: fc.record({ t: fc.constant('advance' as const), ms: fc.integer({ min: 0, max: 6_000 }) }), weight: 2 },
   fc.constant({ t: 'repeat' as const }),
+  fc.constant({ t: 'reuse' as const }),
 )
 
-/** A write as sent: everything needed to send it again. */
 interface Call {
-  t: Exclude<Op['t'], 'ingest' | 'advance' | 'repeat'>
+  t: Exclude<Op['t'], 'ingest' | 'advance' | 'repeat' | 'reuse'>
   actor: string
   id: number
   epoch: number
@@ -66,10 +62,48 @@ interface ModelTask {
   lease: number | null
 }
 
+function writeOf(call: Call): string {
+  const { t, id, epoch, lease, retry } = call
+  switch (t) {
+    case 'claim':
+      return JSON.stringify({ t, lease })
+    case 'renew':
+      return JSON.stringify({ t, id, epoch, lease })
+    case 'fail':
+      return JSON.stringify({ t, id, epoch, retry })
+    case 'complete':
+    case 'release':
+    case 'block':
+      return JSON.stringify({ t, id, epoch })
+    case 'unblock':
+    case 'requeue':
+    case 'cancel':
+      return JSON.stringify({ t, id })
+  }
+}
+
+function changeOneField(call: Call): Call {
+  switch (call.t) {
+    case 'claim':
+    case 'renew':
+      return { ...call, lease: call.lease + 1 }
+    case 'fail':
+      return { ...call, retry: !call.retry }
+    case 'complete':
+    case 'release':
+    case 'block':
+      return { ...call, epoch: call.epoch + 1 }
+    case 'unblock':
+    case 'requeue':
+    case 'cancel':
+      return { ...call, id: call.id + 1 }
+  }
+}
+
 class Model {
   tasks: ModelTask[] = []
   ids = new Map<number, number>()
-  requests = new Map<string, Outcome>()
+  requests = new Map<string, { write: string; outcome: Outcome }>()
 
   ingest(key: number, retry: 'safe' | 'manual', max: number): void {
     if (this.ids.has(key)) return
@@ -86,13 +120,14 @@ class Model {
     }
   }
 
-  apply(call: Call, now: number): Outcome {
+  apply(call: Call, now: number): { outcome: Outcome; replayed: boolean } {
     this.expire(now)
+    const write = writeOf(call)
     const prior = this.requests.get(call.requestId)
-    if (prior) return prior
+    if (prior) return prior.write === write ? { outcome: prior.outcome, replayed: true } : { outcome: { code: 'request_id_reused' }, replayed: false }
     const outcome = this.#apply(call, now)
-    if ('ok' in outcome && outcome.ok !== null) this.requests.set(call.requestId, outcome)
-    return outcome
+    if ('ok' in outcome && outcome.ok !== null) this.requests.set(call.requestId, { write, outcome })
+    return { outcome, replayed: false }
   }
 
   #apply(call: Call, now: number): Outcome {
@@ -177,8 +212,38 @@ function send(store: Store, call: Call): Outcome {
   }
 }
 
+function replay(events: TaskEvent[]): Map<number, Omit<ModelTask, 'max' | 'retry'>> {
+  const tasks = new Map<number, Omit<ModelTask, 'max' | 'retry'>>()
+  for (const event of events) {
+    const data = event.data as { epoch?: number; leaseExpiresAt?: number | null }
+    const task = tasks.get(event.taskId) ?? { state: 'ready', holder: null, epoch: 0, attempts: 0, lease: null }
+    switch (event.type) {
+      case 'task.created':
+        break
+      case 'task.claimed':
+        Object.assign(task, { state: 'claimed', holder: event.actor, epoch: data.epoch, lease: data.leaseExpiresAt, attempts: task.attempts + 1 })
+        break
+      case 'task.renewed':
+        task.lease = data.leaseExpiresAt ?? null
+        break
+      case 'task.logged':
+      case 'task.memo':
+        break
+      default:
+        Object.assign(task, { state: event.to, holder: null, lease: null })
+        if (event.type === 'task.released' || event.type === 'task.blocked') task.attempts -= 1
+    }
+    tasks.set(event.taskId, task)
+  }
+  return tasks
+}
+
+function newEvents(store: Store, after: number): TaskEvent[] {
+  return store.events({ after, limit: 1000 }).filter((e) => e.type !== 'task.lease_expired')
+}
+
 function checkInvariants(store: Store, model: Model, now: number): void {
-  model.expire(now) // reads record expired leases too
+  model.expire(now)
   const events: TaskEvent[] = []
   for (let page = store.events({ limit: 1000 }); page.length > 0; page = store.events({ after: page.at(-1)!.seq, limit: 1000 })) {
     events.push(...page)
@@ -189,6 +254,7 @@ function checkInvariants(store: Store, model: Model, now: number): void {
     'event sequence numbers have no gaps',
   )
   const { tasks } = store.tasks()
+  const replayedTasks = replay(events)
   assert.equal(tasks.length, model.tasks.length, 'one task per dedupe key')
   for (const task of tasks) {
     const expected = model.tasks[task.id - 1]!
@@ -204,6 +270,12 @@ function checkInvariants(store: Store, model: Model, now: number): void {
     assert.equal(own[0]?.from, null)
     for (let i = 1; i < own.length; i++) assert.equal(own[i]!.from, own[i - 1]!.to, `task ${task.id}'s events form a chain`)
     assert.equal(own.at(-1)!.to, task.state, `task ${task.id}'s last event matches its state`)
+    const replayed = replayedTasks.get(task.id)
+    assert.deepEqual(
+      replayed,
+      { state: task.state, holder: task.holder, epoch: task.epoch, attempts: task.attempts, lease: task.leaseExpiresAt },
+      `replaying task ${task.id}'s events reproduces its state`,
+    )
     const finished = own.findIndex((e) => TERMINAL.has(e.to))
     if (finished >= 0) assert.ok(own.slice(finished + 1).every((e) => e.from === e.to), 'a finished task never changes state')
   }
@@ -212,7 +284,7 @@ function checkInvariants(store: Store, model: Model, now: number): void {
 test('generated sequences keep the store equal to the lifecycle model', () => {
   let run = 0
   fc.assert(
-    fc.property(fc.array(op, { maxLength: 60 }), (ops) => {
+    fc.property(fc.array(op, { maxLength: 80, size: 'max' }), (ops) => {
       let now = 0
       const store = openStore({ path: join(dir, `${run++}.db`), clock: () => now })
       const model = new Model()
@@ -223,13 +295,19 @@ test('generated sequences keep the store equal to the lifecycle model', () => {
           if (step.t === 'advance') {
             now += step.ms
           } else if (step.t === 'ingest') {
-            store.ingest({ queue: 'q', kind: 'k', source: 's', dedupeKey: `k${step.key}`, title: 't', retry: step.retry, maxAttempts: step.max }, { actor: 'source:s' })
+            const before = store.events({ limit: 1000 }).length
+            const { created } = store.ingest({ queue: 'q', kind: 'k', source: 's', dedupeKey: `k${step.key}`, title: 't', retry: step.retry, maxAttempts: step.max }, { actor: 'source:s' })
+            assert.equal(created, !model.ids.has(step.key))
             model.ingest(step.key, step.retry, step.max)
+            assert.equal(newEvents(store, before).length, created ? 1 : 0, 'an ingest appends one event only when it creates a task')
           } else {
+            const fallback: Call = { t: 'claim', actor: AGENTS[0]!, id: 0, epoch: 0, lease: 1_000, retry: false, requestId: `r${i}` }
             const call: Call =
               step.t === 'repeat'
-                ? last?.call ?? { t: 'claim', actor: AGENTS[0]!, id: 0, epoch: 0, lease: 1_000, retry: false, requestId: `r${i}` }
-                : (() => {
+                ? last?.call ?? fallback
+                : step.t === 'reuse'
+                  ? last ? changeOneField(last.call) : fallback
+                  : (() => {
                     const actor = AGENTS['agent' in step ? step.agent : 0]!
                     const id = 'key' in step ? (model.ids.get(step.key) ?? 99) : 0
                     const epoch = (remembered[AGENTS.indexOf(actor)]!.get(id) ?? 0) - ('stale' in step && step.stale ? 1 : 0)
@@ -238,13 +316,12 @@ test('generated sequences keep the store equal to the lifecycle model', () => {
                   })()
             const before = store.events({ limit: 1000 }).length
             const outcome = send(store, call)
-            assert.deepEqual(outcome, model.apply(call, now), `step ${i}: ${JSON.stringify(call)}`)
-            if ('code' in outcome) {
-              const added = store.events({ after: before, limit: 1000 })
-              assert.ok(added.every((e) => e.type === 'task.lease_expired'), 'a failed write appends no event')
-            }
+            const expected = model.apply(call, now)
+            assert.deepEqual(outcome, expected.outcome, `step ${i}: ${JSON.stringify(call)}`)
+            const changed = 'ok' in outcome && outcome.ok !== null && !expected.replayed
+            assert.equal(newEvents(store, before).length, changed ? 1 : 0, `step ${i}: a write appends one event only when it changes something`)
             if ('ok' in outcome && outcome.ok && call.t === 'claim') remembered[AGENTS.indexOf(call.actor)]!.set(outcome.ok.id, outcome.ok.epoch)
-            if (step.t !== 'repeat') last = { call, outcome }
+            if (step.t !== 'repeat' && step.t !== 'reuse') last = { call, outcome }
           }
           checkInvariants(store, model, now)
         })
