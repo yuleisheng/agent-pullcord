@@ -9,11 +9,14 @@ import { run } from './run.ts'
 const usage = `Usage: pullcord [--json] <command>
 
 Setup:
-  init [--db <path>]
-  serve [--listen <addr>] [--public-url <url>]
+  init [--db <path>] [--keys <path>]
+  serve [--listen <addr>] [--public-url <url>] [--db <path>] [--keys <path>] [--sources <path>]
   sources add <pagerduty|github|generic> --queue <queue> [--retry safe|manual]
+    [--public-url <url>] [--name <name>] [--sources <path>] [--secret-file <path>]
+    PagerDuty requires --secret-file; use the signing secret provided by PagerDuty.
   keys create <agent> --queues <scope[,scope...]> [--can <action[,action...]>]
   keys list | keys revoke <agent>
+    Use --keys <path> to select a non-default key file. Restart serve to reload changes.
 
 Work:
   claim <queue> [--label k=v] [--wait 30s] [--lease 15m]
@@ -111,6 +114,41 @@ async function events(client: Client, after: number, follow: boolean, json: bool
 }
 
 async function dispatch(command: string, args: string[], json: boolean): Promise<unknown> {
+  const keyFile = { keys: { type: 'string' } } as const
+  switch (command) {
+    case 'init': {
+      const { values } = options(args, { db: { type: 'string' }, ...keyFile }, 0)
+      return (await import('./setup.ts')).init(values)
+    }
+    case 'serve': {
+      const { serve } = await import('../serve.ts')
+      serve(json ? ['--json', ...args] : args)
+      return
+    }
+    case 'sources': {
+      const { positionals: [action, provider], values } = options(args, {
+        sources: { type: 'string' }, name: { type: 'string' }, queue: { type: 'string' }, retry: { type: 'string' },
+        'public-url': { type: 'string' }, 'secret-file': { type: 'string' },
+      }, 2)
+      if (action !== 'add') invalid('Use pullcord sources add <pagerduty|github|generic>.')
+      return (await import('./setup.ts')).addSource(provider, values)
+    }
+    case 'keys': {
+      const [action, ...rest] = args
+      const setup = await import('./setup.ts')
+      if (action === 'create') {
+        const { positionals: [agent], values } = options(rest, { ...keyFile, queues: { type: 'string' }, can: { type: 'string' } }, 1)
+        return setup.createKey(agent, values)
+      }
+      if (action === 'list') return setup.listKeys(options(rest, keyFile, 0).values.keys)
+      if (action === 'revoke') {
+        const { positionals: [agent], values } = options(rest, keyFile, 1)
+        return setup.revokeKey(agent, values.keys)
+      }
+      invalid('Use pullcord keys create, list, or revoke.')
+    }
+  }
+
   const client = new Client()
   switch (command) {
     case 'tasks': {

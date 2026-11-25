@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -15,6 +15,7 @@ import { openStore } from '../src/store.ts'
 const bin = fileURLToPath(new URL('../src/cli/index.ts', import.meta.url))
 const first = 'a4'.repeat(32)
 const second = 'b1'.repeat(32)
+const runner = 'db'.repeat(32)
 const clockStart = 2_009_000
 
 function directory(t: TestContext) {
@@ -28,19 +29,31 @@ type CliResult = { code: number | null; signal: NodeJS.Signals | null; stdout: s
 function cli(t: TestContext, cwd: string, url?: string) {
   function start(args: string[], key = first, preload?: string) {
     const flags = preload ? ['--import', `data:text/javascript,${encodeURIComponent(preload)}`] : []
+    const group = process.platform !== 'win32'
     const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', ...flags, bin, '--json', ...args], {
-      cwd, env: { ...process.env, XDG_STATE_HOME: join(cwd, 'state'), PULLCORD_URL: url, PULLCORD_KEY: key },
+      cwd, detached: group, env: { ...process.env, XDG_STATE_HOME: join(cwd, 'state'), PULLCORD_URL: url, PULLCORD_KEY: key },
       stdio: preload ? ['ignore', 'pipe', 'pipe', 'ipc'] : ['ignore', 'pipe', 'pipe'],
     })
     let stdout = '', stderr = ''
+    let finished = false
     child.stdout!.setEncoding('utf8').on('data', (chunk) => { stdout += chunk })
     child.stderr!.setEncoding('utf8').on('data', (chunk) => { stderr += chunk })
     const done = new Promise<CliResult>((resolve, reject) => {
       child.once('error', reject)
-      child.once('close', (code, signal) => resolve({ code, signal, stdout, stderr }))
+      child.once('close', (code, signal) => {
+        finished = true
+        resolve({ code, signal, stdout, stderr })
+      })
     })
     t.after(async () => {
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      if (!finished && child.pid) {
+        try {
+          if (group) process.kill(-child.pid, 'SIGKILL')
+          else child.kill('SIGKILL')
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+        }
+      }
       await done
     })
     return { child, done }
@@ -80,8 +93,12 @@ async function hub(t: TestContext) {
   const dir = directory(t)
   let now = clockStart
   const store = openStore({ path: join(dir, 'hub.db'), clock: () => now })
-  const can = ['read', 'claim', 'renew', 'complete', 'fail', 'release', 'block']
-  const server = createHttpServer(store, [first, second].map((key, index) => ({
+  const holder = ['claim', 'renew', 'complete', 'fail', 'release', 'block']
+  const agent = [...holder, 'read', 'log', 'memo']
+  const credentials = [
+    { key: first, can: agent }, { key: second, can: [...agent, 'admin'] }, { key: runner, can: holder },
+  ]
+  const server = createHttpServer(store, credentials.map(({ key, can }, index) => ({
     agent: `worker-${index}`, sha256: createHash('sha256').update(key).digest('hex'), queues: ['incidents/'], can,
   })))
   server.once('close', () => store.close())
@@ -151,17 +168,18 @@ test('release, retry and block pass their distinct holder operations to the serv
 
 const worker = `console.log('worker ' + process.pid); setInterval(() => {}, 10_000)`
 
-async function workerPid(child: ChildProcess) {
-  const lines = createInterface({ input: child.stderr! })
+async function matchingLine(stream: NonNullable<ChildProcess['stdout']>, match: (line: string) => boolean) {
+  const lines = createInterface({ input: stream })
   try {
-    for await (const line of lines) {
-      const match = /^worker (\d+)$/.exec(line)
-      if (match) return Number(match[1])
-    }
+    for await (const line of lines) if (match(line)) return line
   } finally {
     lines.close()
   }
-  assert.fail('The command never started.')
+  assert.fail('The command exited without the expected output.')
+}
+
+async function workerPid(child: ChildProcess) {
+  return Number((await matchingLine(child.stderr!, (line) => /^worker \d+$/.test(line))).slice('worker '.length))
 }
 
 test('run executes literal command arguments, settles from exit status, and releases only after Ctrl-C stops the child', { timeout: 10_000 }, async (t) => {
@@ -186,7 +204,7 @@ test('run executes literal command arguments, settles from exit status, and rele
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' })
 })
 
-test('run stops its child when its renewal is fenced and never attempts a settlement', { timeout: 10_000 }, async (t) => {
+test('run renews at a third of the lease and stops its child when renewal loses the claim', { timeout: 10_000 }, async (t) => {
   const server = await hub(t)
   const queue = 'incidents/renewal'
   const id = String(server.seed(queue, 'lose-lease'))
@@ -195,14 +213,23 @@ test('run stops its child when its renewal is fenced and never attempts a settle
     import { createRequire, syncBuiltinESMExports } from 'node:module';
     const timers = createRequire('/preload.js')('node:timers/promises');
     const delay = timers.setTimeout;
-    timers.setTimeout = (ms, value, options) => ms === 300_000
-      ? once(process, 'message', { signal: options.signal }).then(() => value)
-      : delay(ms, value, options);
+    timers.setTimeout = (ms, value, options) => {
+      if (ms !== 300_000) return delay(ms, value, options);
+      process.send('scheduled');
+      return once(process, 'message', { signal: options.signal }).then(() => value);
+    };
     syncBuiltinESMExports();`
   const running = server.start(['run', queue, '--', process.execPath, '-e', worker], first, preload)
+  const scheduled = once(running.child, 'message')
   const pid = await workerPid(running.child)
   assert.equal(success(await server.call(['show', id])).lease_expires_at, clockStart + 900_000)
-  server.setTime(clockStart + 900_000)
+  assert.equal((await scheduled)[0], 'scheduled')
+  server.setTime(clockStart + 300_000)
+  const next = once(running.child, 'message')
+  running.child.send('renew')
+  assert.equal((await next)[0], 'scheduled')
+  assert.equal(success(await server.call(['show', id])).lease_expires_at, clockStart + 1_200_000)
+  server.setTime(clockStart + 1_200_000)
   running.child.send('renew')
   const result = await running.done
   assert.equal(result.code, 1)
@@ -213,30 +240,45 @@ test('run stops its child when its renewal is fenced and never attempts a settle
   assert.equal(success(await server.call(['show', id])).state, 'interrupted')
 })
 
-test('run by ID claims that exact task without reading other tasks or falling back to the queue', { timeout: 10_000 }, async (t) => {
-  const writes: Record<string, unknown>[] = []
-  const url = await listen(t, createServer(async (req, res) => {
-    let text = ''
-    for await (const chunk of req.setEncoding('utf8')) text += chunk
-    const body = text ? JSON.parse(text) : {}
-    writes.push(body)
-    res.setHeader('Content-Type', 'application/json')
-    if (req.method === 'POST' && req.url === '/tasks/claim' && body.id === 8 && body.queue === undefined) {
-      res.end(JSON.stringify({ id: 8, epoch: 4, queue: 'incidents/exact', state: 'claimed' }))
-    } else if (req.method === 'POST' && req.url === '/tasks/8/complete' && body.epoch === 4) {
-      res.end(JSON.stringify({ id: 8, epoch: 4, queue: 'incidents/exact', state: 'completed' }))
-    } else {
-      res.writeHead(404).end(JSON.stringify({ code: 'not_found', message: 'No visible task.' }))
-    }
-  }))
-  const command = cli(t, directory(t), url)
-  const result = success(await command.call(['run', '8', '--', process.execPath, '-e', '']), 0)
-  assert.deepEqual([result.id, result.state], [8, 'completed'])
-  failure(await command.call(['run', '99', '--', process.execPath, '-e', 'console.log("must not run")']), 'not_found')
-  const ids = writes.map(({ request_id }) => request_id)
-  assert.equal(writes.length, 3)
-  assert.equal(new Set(ids).size, 3)
-  assert.ok(ids.every((id) => typeof id === 'string' && id.length > 0))
+test('run by ID can claim a younger task without read access and never falls back to its queue', { timeout: 10_000 }, async (t) => {
+  const server = await hub(t)
+  const queue = 'incidents/exact'
+  const older = server.seed(queue, 'older')
+  const requested = server.seed(queue, 'younger')
+  const outOfScope = server.seed('private/queue', 'out-of-scope')
+  const execute = (id: number) => server.call(['run', String(id), '--', process.execPath, '-e', ''], runner)
+  failure(await server.call(['show', String(requested)], runner), 'forbidden')
+  const settled = success(await execute(requested))
+  assert.deepEqual([settled.id, settled.state], [requested, 'completed'])
+  failure(await execute(outOfScope), 'not_found')
+  failure(await execute(4_001), 'not_found')
+  assert.equal(success(await server.call(['show', String(older)])).state, 'ready')
+})
+
+test('log and memo need no epoch, but admin writes still enforce scope and cancel fences the holder', { timeout: 15_000 }, async (t) => {
+  const server = await hub(t)
+  const queue = 'incidents/oversight'
+  const id = String(server.seed(queue, 'admin'))
+  const outside = String(server.seed('private/queue', 'outside'))
+  const logged = success(await server.call(['log', id, 'Investigating']))
+  assert.equal(logged.type, 'task.logged')
+  assert.deepEqual(logged.data, { text: 'Investigating' })
+  assert.deepEqual(success(await server.call(['memo', id, 'approved', 'false'])), { value: false })
+  assert.deepEqual(success(await server.call(['memo', id, 'approved', 'true'])), { value: false })
+  assert.deepEqual(success(await server.call(['memo', id, 'approved'])), { value: false })
+  failure(await server.call(['memo', id, 'constructor']), 'not_found')
+
+  success(await server.call(['claim', queue]))
+  success(await server.call(['block', id, 'Needs approval']))
+  failure(await server.call(['unblock', id]), 'forbidden')
+  assert.equal(success(await server.call(['unblock', id], second)).state, 'ready')
+  success(await server.call(['claim', queue, '--lease', '10s']))
+  server.setTime(clockStart + 10_000)
+  assert.equal(success(await server.call(['requeue', id], second)).state, 'ready')
+  success(await server.call(['claim', queue]))
+  failure(await server.call(['cancel', outside, 'out of scope'], second), 'not_found')
+  assert.equal(success(await server.call(['cancel', id, 'No longer needed', '--json'], second)).reason, 'No longer needed')
+  failure(await server.call(['complete', id]), 'claim_lost')
 })
 
 test('events --follow emits in order, retries the last emitted cursor, and aborts the long poll on Ctrl-C', { timeout: 10_000 }, async (t) => {
@@ -271,4 +313,82 @@ test('events --follow emits in order, retries the last emitted cursor, and abort
   assert.deepEqual(stopped.stdout.trim().split('\n').map((line) => JSON.parse(line)), [{ seq: 5 }, { seq: 6 }, { seq: 7 }])
   assert.deepEqual(seen, [['4', null], ['4', '30'], ['6', '30'], ['6', '30'], ['7', '30']])
   await closed
+})
+
+test('init and keys issue secrets once and serve reloads revocation only on restart', { timeout: 15_000 }, async (t) => {
+  const dir = directory(t)
+  const db = 'team.db'
+  const keys = 'team-keys.json'
+  const setup = cli(t, dir, 'https://hub.example.test/pullcord')
+  const initialized = success(await setup.call(['init', '--db', db, '--keys', keys]))
+  assert.deepEqual([initialized.db, initialized.keys], [db, keys])
+  assert.match(initialized.admin_key, /^[0-9a-f]{64}$/)
+  assert.ok(existsSync(join(dir, db)))
+  const before = readFileSync(join(dir, keys), 'utf8')
+  const admin = JSON.parse(before)[0]
+  assert.deepEqual([admin.agent, admin.queues, admin.sha256], ['admin', ['*'], createHash('sha256').update(initialized.admin_key).digest('hex')])
+  failure(await setup.call(['init', '--db', 'new.db', '--keys', keys]), 'invalid_argument')
+  assert.ok(!existsSync(join(dir, 'new.db')))
+  assert.equal(readFileSync(join(dir, keys), 'utf8'), before)
+
+  const created = success(await setup.call(['keys', 'create', 'watcher', '--keys', keys, '--queues', '*', '--can', 'read,events']))
+  const agent = success(await setup.call(['keys', 'create', 'worker', '--keys', keys, '--queues', 'incidents/,issues']))
+  assert.deepEqual(agent.queues, ['incidents/', 'issues'])
+  assert.ok(agent.can.includes('claim') && !agent.can.includes('events') && !agent.can.includes('admin'))
+  assert.deepEqual(created.mcp, { mcpServers: { pullcord: {
+    url: 'https://hub.example.test/pullcord/mcp', headers: { Authorization: `Bearer ${created.key}` },
+  } } })
+  failure(await setup.call(['keys', 'create', 'watcher', '--keys', keys, '--queues', '*']), 'invalid_argument')
+  const list = success(await setup.call(['keys', 'list', '--keys', keys]))
+  assert.deepEqual(list.keys, [
+    { agent: 'admin', queues: ['*'], can: admin.can },
+    { agent: 'watcher', queues: ['*'], can: ['read', 'events'] },
+    { agent: 'worker', queues: agent.queues, can: agent.can },
+  ])
+  assert.equal(statSync(join(dir, keys)).mode & 0o777, 0o600)
+  const stored = readFileSync(join(dir, keys), 'utf8')
+  for (const key of [initialized.admin_key, created.key, agent.key]) assert.ok(!stored.includes(key))
+
+  async function serve() {
+    const server = setup.start(['serve', '--listen', '127.0.0.1:0', '--db', db, '--keys', keys])
+    const { url } = JSON.parse(await matchingLine(server.child.stdout!, (line) => line.startsWith('{')))
+    return { ...cli(t, dir, url), stop: () => { server.child.kill('SIGTERM'); return server.done } }
+  }
+  const server = await serve()
+  assert.deepEqual(success(await server.call(['tasks'], created.key)), { tasks: [], cursor: 0 })
+  assert.deepEqual(success(await server.call(['tasks'], agent.key)), { tasks: [] })
+  assert.equal(success(await setup.call(['keys', 'revoke', 'watcher', '--keys', keys])).restart_required, true)
+  assert.deepEqual(success(await server.call(['tasks'], created.key)), { tasks: [], cursor: 0 })
+  await server.stop()
+
+  const restarted = await serve()
+  failure(await restarted.call(['tasks'], created.key), 'unauthorized')
+  assert.deepEqual(success(await restarted.call(['tasks'], initialized.admin_key)), { tasks: [], cursor: 0 })
+  await restarted.stop()
+})
+
+test('sources add issues generated secrets but imports the PagerDuty secret without echoing it', { timeout: 10_000 }, async (t) => {
+  const dir = directory(t)
+  const command = cli(t, dir, 'https://hub.example.test')
+  const file = join(dir, 'pullcord-sources.json')
+  const github = success(await command.call(['sources', 'add', 'github', '--name', 'ci', '--queue', 'ci/failures', '--retry', 'safe']))
+  assert.deepEqual([github.webhook_url, github.retry, github.restart_required], ['https://hub.example.test/ingest/ci', 'safe', true])
+  assert.match(github.secret, /^[0-9a-f]{64}$/)
+  const before = readFileSync(file, 'utf8')
+  const pagerduty = ['sources', 'add', 'pagerduty', '--queue', 'incidents/production', '--public-url', 'https://alerts.example.test/base']
+  const missing = failure(await command.call(pagerduty), 'invalid_argument')
+  assert.match(missing.message, /https:\/\/alerts\.example\.test\/base\/ingest\/pagerduty/)
+  assert.equal(readFileSync(file, 'utf8'), before)
+  const supplied = 'pagerduty-provided-secret-+é'
+  writeFileSync(join(dir, 'secret.txt'), `${supplied}\r\n`, { mode: 0o600 })
+  const imported = await command.call([...pagerduty, '--secret-file', 'secret.txt'])
+  const { webhook_url, secret } = success(imported)
+  assert.equal(webhook_url, 'https://alerts.example.test/base/ingest/pagerduty')
+  assert.equal(secret, undefined)
+  assert.ok(!`${imported.stdout}${imported.stderr}`.includes(supplied))
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), [
+    { name: 'ci', provider: 'github', queue: 'ci/failures', retry: 'safe', secret: github.secret },
+    { name: 'pagerduty', provider: 'pagerduty', queue: 'incidents/production', retry: 'manual', secret: supplied },
+  ])
+  assert.equal(statSync(file).mode & 0o777, 0o600)
 })
