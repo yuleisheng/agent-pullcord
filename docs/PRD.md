@@ -50,11 +50,11 @@ The task model follows [Vercel Board](https://github.com/vercel/board)'s tasks. 
 | D5 | Each task kind declares `retry: safe` or `retry: manual`. When a lease expires on a manual task, the task becomes `interrupted`, not `ready`. | Fencing protects the hub's state, not the outside world. A lost lease halfway through a rollback must not start a second rollback. Taken from Pi Durable's `replay: "safe"`. |
 | D6 | Every write accepts a `request_id`. Repeating a write with the same ID returns the original result and changes nothing. Ingest is idempotent on (source, dedupe key). | Clients and providers retry after timeouts and crashes. Taken from Pi Durable's `requestId`. |
 | D7 | Every state change appends one event, in the same transaction. Events carry a gap-free sequence number that clients use as a cursor. | The audit log can never disagree with the state. The same log drives watchers and bridges. |
-| D8 | Watchers read state plus a cursor, then long-poll for events after the cursor. | A client that restarts resumes from its saved cursor and misses nothing. v1 needs no streaming infrastructure. |
+| D8 | Watchers read state plus a cursor, then long-poll for events after the cursor. The global cursor and complete event feed require all-queue access and the `events` action. | A client that restarts resumes from its saved cursor and misses nothing. Queue-scoped keys cannot infer other queues' activity from the global cursor. v1 needs no streaming infrastructure. |
 | D9 | Memos: a small value stored on a task, where the first write wins. | Approvals and other decisions survive restarts instead of being asked again. Taken from Pi Durable. |
 | D10 | Write-back to sources (a PagerDuty note, a GitHub comment), escalation, and notifications are bridges. A bridge is a consumer of the event log, not part of the core. | Keeps the core small. Bridges can fail and resume without affecting task state. |
 | D11 | Each agent has its own API key, scoped to queues and actions, stored hashed, and revocable. No shared passwords. | Every claim and every event names the agent that acted. |
-| D12 | TypeScript on Node 22 or later, using Node's built-in `node:sqlite`, published to npm. Keep the core free of Node-specific APIs, so only the storage adapter depends on Node. A standalone binary can come later, built with `bun build --compile` and a `bun:sqlite` adapter. | Vercel Board and Pi Durable both work this way: npm packages on Node with `node:sqlite`. Board's package has three dependencies and no native modules, so `npx` works with nothing to compile. Pi also ships Bun-compiled binaries for its coding agent, for machines without Node. Risk: Node still flags `node:sqlite` as experimental (Board hides the warning), so pin and test the Node versions we support. |
+| D12 | TypeScript on Node 22 or later, using Node's built-in `node:sqlite`, published to npm. Only the SQLite adapter and thin transport/bootstrap adapter may use Node-specific APIs. Core request handlers stay independent of both adapters. A standalone binary can come later, built with `bun build --compile` and a `bun:sqlite` adapter. | Vercel Board and Pi Durable both work this way: npm packages on Node with `node:sqlite`. Board's package has three dependencies and no native modules, so `npx` works with nothing to compile. Pi also ships Bun-compiled binaries for its coding agent, for machines without Node. Risk: Node still flags `node:sqlite` as experimental (Board hides the warning), so pin and test the Node versions we support. |
 | D13 | Apache-2.0 license. | Permissive, with a patent grant. |
 | D14 | All logic lives in the server. The CLI and the MCP endpoint are thin clients of the HTTP API. | Every interface behaves the same, and adding an interface is cheap. |
 | D15 | The name is `agent-pullcord`, and the CLI is `pullcord`. | In Toyota's factories, any worker pulls the andon cord to signal a problem, and someone comes to own it. That is this service's job in a software factory. "Pull" also names the design: agents pull tasks. As of 2026-11-25, `agent-pullcord` was unused on npm and GitHub. "event-hub" collided with Azure Event Hubs, and `agent-andon` was already an npm package for AI coding agents. |
@@ -125,9 +125,10 @@ Agent endpoints take `Authorization: Bearer <key>`. Task JSON uses snake_case fi
 - **Ingest:**
   - `POST /ingest/:source`: verifies the source's signature, maps the event to a task or a cancel, and answers `202`.
 - **Read** (requires the `read` action):
-  - `GET /tasks?queue=&state=&label=`: returns `{ tasks, cursor }` with tasks in the key's queues and the current global event cursor. An explicit `queue` must be within scope; a slash-terminated queue matches its descendants. Repeat `label=key=value` to require multiple labels.
+  - `GET /tasks?queue=&state=&label=`: returns `{ tasks }` with tasks in the key's queues. Only keys with the `*` queue grant and the `events` action also get `cursor`, the current global event cursor. An explicit `queue` must be within scope; a slash-terminated queue matches its descendants. Repeat `label=key=value` to require multiple labels.
   - `GET /tasks/:id`: returns one task with its `memos` object. Out-of-scope and missing IDs both return `404 not_found`.
-  - `GET /events?after=<cursor>&wait=<seconds>`: long-polls events after the cursor.
+- **Watch** (requires the `*` queue grant and the `events` action):
+  - `GET /events?after=<cursor>&wait=<seconds>`: long-polls the complete, unfiltered event feed after the cursor. A watcher that takes its initial snapshot from `GET /tasks` also needs `read`.
 - **Holder writes** (each takes `epoch` and `request_id`):
   - `POST /tasks/claim` with `{ queue, labels?, wait?, lease? }`: claims the match that has been ready longest, or waits up to `wait`. A `queue` ending in `/`, such as `incidents/`, matches every queue that starts with it; any other `queue` matches exactly. A match has every label in `labels`.
   - `POST /tasks/:id/renew`, `/complete`, `/fail`, `/release`, `/block`.
@@ -167,7 +168,7 @@ The hub serves MCP itself at `/mcp`, over streamable HTTP, authenticated with th
 - **`claim` waits** at most 60 seconds, because MCP tool calls time out. An agent that needs to wait longer calls it again.
 - **`run` is CLI only.**
 
-**Errors** are JSON with a stable `code`, for example `claim_lost`, `task_claimed`, `nothing_ready`, `unauthorized`, `forbidden`, `invalid_transition`, `not_found`, `invalid_argument`, `request_id_reused`, or `store_locked` (another process owns the database). A missing or invalid agent key returns `401 unauthorized`; insufficient action or explicit queue scope returns `403 forbidden`. Each error says what the caller can do next. `max_attempts` is 1 to 100.
+**Errors** are JSON with a stable `code`, for example `claim_lost`, `task_claimed`, `nothing_ready`, `unauthorized`, `forbidden`, `invalid_transition`, `not_found`, `invalid_argument`, `request_id_reused`, or `store_locked` (another process owns the database). A missing or invalid agent key returns `401 unauthorized`; insufficient action or explicit queue scope returns `403 forbidden`. An unexpected server error returns `500 internal_error` with a generic message and no underlying exception details. Each error says what the caller can do next. `max_attempts` is 1 to 100.
 
 ### v1 sources
 
@@ -181,7 +182,7 @@ Webhooks need a public HTTPS address. v1 documents running the hub behind a reve
 
 - **Sources.** Verify every source's signature and reject replays outside a short time window. Unverified requests create nothing.
 - **Who can create tasks.** Only verified sources and admin keys. Whoever creates tasks steers the agents.
-- **Agent keys.** Each key belongs to one agent, is limited to its queues and actions, is stored hashed, can be revoked, and is shown only once. Until key management ships, `serve` loads `{ agent, sha256, queues, can }` entries from a JSON file at startup. Keys are 32 random bytes encoded as hex, with only the SHA-256 digest of that hex string in the file. Queue grants are exact names, slash-terminated prefixes, or `*` for every queue. Remove an entry and restart to revoke it; keep the agent name stable when rotating its key.
+- **Agent keys.** Each key belongs to one agent, is limited to its queues and actions, is stored hashed, can be revoked, and is shown only once. Until key management ships, `serve` loads `{ agent, sha256, queues, can }` entries from a JSON file at startup. Keys are 32 random bytes encoded as hex, with only the SHA-256 digest of that hex string in the file. Queue grants are exact names, slash-terminated prefixes, or `*` for every queue. Removing an entry revokes its key only after `serve` restarts. Keep the agent name stable when rotating its key.
 - **Untrusted payloads.** Task titles and payloads come from outside. The API and MCP tools return them in fields marked untrusted, separate from fields the hub sets. Agents must not follow instructions found in them.
 - **Rate limits and audit.** Ingest is rate limited per source. The event log is append-only.
 - **Limit.** The hub can't make agents safe. A crafted alert is a path for prompt injection into agents that have production access. Whatever an agent's own credentials allow is the real security boundary.
@@ -207,7 +208,7 @@ Each check runs against the built package, a real `serve` process, through its H
 - **Expect:** the task is `canceled`, and the holder's next write gets `claim_lost`.
 
 ### A watcher survives a hub restart
-- **Reach it:** read the cursor, make changes, kill the hub with `kill -9`, restart it, then call `GET /events?after=<cursor>`.
+- **Reach it:** with an all-queue key that has `read` and `events`, read the cursor, make changes, kill the hub with `kill -9`, restart it, then call `GET /events?after=<cursor>`.
 - **Expect:** every event since the cursor, in order, with no gaps and no duplicates.
 
 ### Generated sequences

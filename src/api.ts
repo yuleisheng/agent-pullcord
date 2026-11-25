@@ -1,7 +1,9 @@
-import { StoreError } from './store.ts'
-import type { ErrorCode, Labels, Store, Task, TaskState } from './store.ts'
+import { StoreError, type ErrorCode } from './store-contract.ts'
+import type { Labels, Store, Task, TaskState } from './store.ts'
 
-const ACTIONS = ['read'] as const
+type TaskReader = Pick<Store, 'tasks' | 'task'>
+
+const ACTIONS = ['read', 'events'] as const
 type Action = (typeof ACTIONS)[number]
 
 const STATES = ['ready', 'claimed', 'blocked', 'interrupted', 'completed', 'failed', 'canceled'] as const satisfies readonly TaskState[]
@@ -133,7 +135,7 @@ function taskJson(task: Task) {
   }
 }
 
-function scopedTask(store: Store, agent: Agent, id: number) {
+function scopedTask(store: TaskReader, agent: Agent, id: number) {
   const task = store.task(id)
   if (!covers(agent, task.queue)) throw new StoreError('not_found', `No task ${id}.`)
   return task
@@ -145,7 +147,7 @@ function json(body: unknown, status = 200): Response {
   return Response.json(body, { status, headers })
 }
 
-export function createApi(store: Store, config: unknown): (request: Request) => Promise<Response> {
+export function createApi(store: TaskReader, config: unknown): (request: Request) => Promise<Response> {
   const keys = keyring(config)
   return async (request) => {
     try {
@@ -159,7 +161,9 @@ export function createApi(store: Store, config: unknown): (request: Request) => 
           throw new ApiError(403, 'forbidden', 'Choose a queue or prefix covered by this key.')
         }
         const { tasks, cursor } = store.tasks(filter)
-        return json({ tasks: tasks.filter(({ queue }) => covers(agent, queue)).map(taskJson), cursor })
+        const visible = tasks.filter(({ queue }) => covers(agent, queue)).map(taskJson)
+        const canWatch = agent.queues.includes('*') && agent.can.includes('events')
+        return json(canWatch ? { tasks: visible, cursor } : { tasks: visible })
       }
       if (request.method === 'GET' && task) {
         requireAction(agent, 'read')
