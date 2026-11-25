@@ -1,13 +1,18 @@
 import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
 import { test } from 'node:test'
-import { readSourceEvent, SourceError } from '../src/sources/index.ts'
+import { SourceError, verifySourceDelivery, type SourceKind } from '../src/sources/index.ts'
 
 const now = Date.parse('2026-11-25T13:06:43.318Z')
 const pagerDutySecret = 'fake-pagerduty-webhook-secret'
 const githubSecret = 'fake-github-webhook-secret'
 const genericSecret = 'fake-generic-webhook-secret'
 const encoder = new TextEncoder()
+
+async function readSourceEvent(provider: SourceKind, secret: string, headers: Headers, body: Uint8Array<ArrayBuffer>, clock: number) {
+  const readEvent = await verifySourceDelivery(provider, secret, headers, body)
+  return readEvent(clock)
+}
 
 function hmac(secret: string, body: Uint8Array): string {
   return createHmac('sha256', secret).update(body).digest('hex')
@@ -95,7 +100,7 @@ test('PagerDuty authenticates exact bytes and does not apply unverified resoluti
   await assert.rejects(readSourceEvent('pagerduty', pagerDutySecret, signed, malformedBytes, now), sourceError(400, 'invalid_argument'))
 })
 
-test('PagerDuty bounds the signed occurrence time before create, cancel, or ignore', async () => {
+test('PagerDuty bounds the signed occurrence time before creating or canceling a task', async () => {
   assert.equal((await pagerDuty(pagerDutyEvent('incident.triggered', now - 300_000))).action, 'create')
   assert.equal((await pagerDuty(pagerDutyEvent('incident.resolved', now + 300_000))).action, 'cancel')
   await assert.rejects(pagerDuty(pagerDutyEvent('incident.triggered', now - 300_001)), sourceError(401, 'unauthorized'))
@@ -108,7 +113,7 @@ test('PagerDuty bounds the signed occurrence time before create, cancel, or igno
     },
   }
   assert.deepEqual(await pagerDuty(ping), { action: 'ignore' })
-  await assert.rejects(pagerDuty(ping, now + 300_001), sourceError(401, 'unauthorized'))
+  assert.deepEqual(await pagerDuty(ping, now + 300_001), { action: 'ignore' })
 
   const payload = pagerDutyEvent('incident.resolved')
   await assert.rejects(pagerDuty({ event: { ...payload.event, occurred_at: '2026-11-25T13:06:43.318' } }), sourceError(401, 'unauthorized'))

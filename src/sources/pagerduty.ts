@@ -3,8 +3,8 @@ import { isoTime, requiredObject, requiredString, requireFresh, sourceUrl, type 
 export function pagerDuty(payload: Record<string, unknown>, now: number): SourceEvent {
   const event = requiredObject(payload.event, 'event')
   const eventType = requiredString(event.event_type, 'event.event_type')
-  requireFresh(isoTime(event.occurred_at), now)
   if (eventType !== 'incident.triggered' && eventType !== 'incident.resolved') return { action: 'ignore' }
+  requireFresh(isoTime(event.occurred_at), now)
 
   const incident = requiredObject(event.data, 'event.data')
   const dedupeKey = requiredString(incident.id, 'event.data.id')
