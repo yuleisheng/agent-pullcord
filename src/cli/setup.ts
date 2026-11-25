@@ -40,7 +40,7 @@ function editConfig<T>(path: string, edit: () => T): T {
     fd = openSync(lock, 'wx', 0o600)
   } catch (error) {
     if (error instanceof Error && 'code' in error && error.code === 'EEXIST') {
-      throw new CliError('store_locked', `Another setup command has locked ${path}. Retry after it exits.`)
+      throw new CliError('store_locked', `Configuration ${path} is locked. If a setup command crashed, stop all setup commands using this file before removing ${lock} and retrying.`)
     }
     throw error
   }

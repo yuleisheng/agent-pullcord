@@ -6,6 +6,10 @@ import type { ClaimSelector, Client } from './client.ts'
 
 type Exit = { code: number; reason?: string }
 
+const useProcessGroup = process.platform !== 'win32'
+const STOP_GRACE_MS = 2_000
+const STOP_POLL_MS = 25
+
 function watchExit(child: ChildProcess): Promise<Exit> {
   return new Promise((resolve) => {
     child.once('error', (error: NodeJS.ErrnoException) => {
@@ -19,19 +23,42 @@ function watchExit(child: ChildProcess): Promise<Exit> {
   })
 }
 
+function signalCommand(child: ChildProcess, signal: NodeJS.Signals | 0): boolean {
+  if (!child.pid) return false
+  if (!useProcessGroup) {
+    return child.exitCode === null && child.signalCode === null && child.kill(signal)
+  }
+  try {
+    return process.kill(-child.pid, signal)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+    return false
+  }
+}
+
+async function stopCommand(child: ChildProcess, signal: NodeJS.Signals): Promise<void> {
+  if (!signalCommand(child, signal)) return
+  const deadline = performance.now() + STOP_GRACE_MS
+  while (signalCommand(child, 0)) {
+    if (performance.now() >= deadline) {
+      signalCommand(child, 'SIGKILL')
+      return
+    }
+    await delay(STOP_POLL_MS)
+  }
+}
+
 export async function run(client: Client, selector: ClaimSelector, command: string[], json: boolean): Promise<unknown> {
   const renewals = new AbortController()
   const interval = DEFAULT_LEASE_MS / 3
   let child: ChildProcess | undefined
-  let killTimer: NodeJS.Timeout | undefined
+  let shutdown: Promise<void> | undefined
+  let shutdownError: unknown
   let interrupted: NodeJS.Signals | undefined
 
   function stopChild(signal: NodeJS.Signals) {
     renewals.abort()
-    if (!child?.pid || child.exitCode !== null || child.signalCode !== null || killTimer) return
-    child.kill(signal)
-    killTimer = setTimeout(() => child?.kill('SIGKILL'), 2_000)
-    killTimer.unref()
+    if (child && !shutdown) shutdown = stopCommand(child, signal).catch((error: unknown) => { shutdownError = error })
   }
 
   function interrupt(signal: NodeJS.Signals) {
@@ -47,7 +74,7 @@ export async function run(client: Client, selector: ClaimSelector, command: stri
     if (!interrupted) {
       try {
         child = spawn(command[0], command.slice(1), {
-          env: { ...process.env, PULLCORD_TASK: JSON.stringify(task) }, stdio: [0, json ? 2 : 1, 2],
+          detached: useProcessGroup, env: { ...process.env, PULLCORD_TASK: JSON.stringify(task) }, stdio: [0, json ? 2 : 1, 2],
         })
       } catch {
         exit = { code: 1, reason: 'Could not start the command.' }
@@ -65,7 +92,9 @@ export async function run(client: Client, selector: ClaimSelector, command: stri
         exit = await watchExit(child)
         renewals.abort()
         await renewing
+        await shutdown
         if (renewalFailure) throw renewalFailure
+        if (shutdownError) throw shutdownError
       }
     }
 
@@ -79,7 +108,6 @@ export async function run(client: Client, selector: ClaimSelector, command: stri
     }
     return await client.holder('complete', task)
   } finally {
-    clearTimeout(killTimer)
     process.off('SIGINT', interrupt)
     process.off('SIGTERM', interrupt)
   }

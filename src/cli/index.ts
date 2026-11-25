@@ -215,7 +215,15 @@ async function dispatch(command: string, args: string[], json: boolean): Promise
       const task = `tasks/${integer(id, 1, 'task ID')}`
       if (text !== undefined) {
         let value: unknown
-        try { value = JSON.parse(text) } catch { value = text }
+        try {
+          value = JSON.parse(text, (_key, item: unknown) => {
+            if (typeof item === 'number' && !Number.isFinite(item)) invalid('Memo numbers must be finite.')
+            return item
+          })
+        } catch (error) {
+          if (!(error instanceof SyntaxError)) throw error
+          value = text
+        }
         return client.write(`${task}/memo`, { key, value })
       }
       const { memos } = await client.request<{ memos: Record<string, unknown> }>(task)
