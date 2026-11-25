@@ -125,7 +125,7 @@ These are the expectations tests are written from. Change one only through a rev
   - `GET /tasks/:id`: returns one task with its memos.
   - `GET /events?after=<cursor>&wait=<seconds>`: long-polls events after the cursor.
 - **Holder writes** (each takes `epoch` and `request_id`):
-  - `POST /tasks/claim` with `{ queue, labels?, wait?, lease? }`: claims the oldest ready match, or waits up to `wait`.
+  - `POST /tasks/claim` with `{ queue, labels?, wait?, lease? }`: claims the oldest ready match, or waits up to `wait`. A `queue` ending in `/`, such as `incidents/`, matches every queue that starts with it; any other `queue` matches exactly. A match has every label in `labels`.
   - `POST /tasks/:id/renew`, `/complete`, `/fail`, `/release`, `/block`.
 - **Other writes:**
   - `POST /tasks/:id/log`: appends a note to the task's log.
@@ -163,7 +163,7 @@ The hub serves MCP itself at `/mcp`, over streamable HTTP, authenticated with th
 - **`claim` waits** at most 60 seconds, because MCP tool calls time out. An agent that needs to wait longer calls it again.
 - **`run` is CLI only.**
 
-**Errors** are JSON with a stable `code`, for example `claim_lost`, `task_claimed`, `nothing_ready`, `forbidden`, or `invalid_transition`. Each error says what the caller can do next.
+**Errors** are JSON with a stable `code`, for example `claim_lost`, `task_claimed`, `nothing_ready`, `forbidden`, `invalid_transition`, `not_found`, `invalid_argument`, `request_id_reused`, or `store_locked` (another process owns the database). Each error says what the caller can do next. `max_attempts` is 1 to 100.
 
 ### v1 sources
 

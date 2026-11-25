@@ -48,8 +48,7 @@ test('the same delivery twice makes one task', () => {
     store.events().map((e) => e.type),
     ['task.created'],
   )
-  // The same dedupe key from another source is another task.
-  assert.equal(store.ingest({ ...incident('P1'), source: 'github' }, { actor: 'source:github' }).created, true)
+  assert.equal(store.ingest({ ...incident('P1'), source: 'github' }, { actor: 'source:github' }).created, true, 'the same dedupe key from another source is another task')
 })
 
 test('a claim takes the oldest ready task that matches its queue and labels', () => {
@@ -170,8 +169,15 @@ test('a write repeated with its request ID returns the first result and changes 
   assert.equal(store.events().length, events)
 
   assert.equal(code(() => store.log(id, { ...A, text: 'note', requestId: 'r1' })), 'request_id_reused')
-  // Request IDs belong to their actor.
-  assert.equal(store.log(id, { ...B, text: 'note', requestId: 'r1' }).type, 'task.logged')
+  assert.equal(
+    code(() => store.complete(id, { ...A, epoch: claim.epoch, result: 'something else', requestId: 'r1' })),
+    'request_id_reused',
+    'the same request ID with different arguments is a different write',
+  )
+  const beforeLog = store.events().length
+  assert.equal(store.log(id, { ...B, text: 'note', requestId: 'r1' }).type, 'task.logged', 'request IDs belong to their actor')
+  assert.equal(store.events().length, beforeLog + 1, 'a log appends one event')
+  assert.equal(store.task(id).state, 'completed', 'a log changes no state')
 })
 
 test('the first memo wins', () => {
@@ -182,11 +188,26 @@ test('the first memo wins', () => {
   assert.equal(store.events().filter((e) => e.type === 'task.memo').length, 1)
 })
 
+function openInChild(path: string): string {
+  const script = `
+    import { openStore } from ${JSON.stringify(new URL('../src/store.ts', import.meta.url).href)}
+    try { openStore({ path: ${JSON.stringify(path)} }).close(); console.log('opened') } catch (error) { console.log(error.code) }
+  `
+  const child = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', '--input-type=module', '-e', script], { encoding: 'utf8' })
+  assert.equal(child.status, 0, child.stderr)
+  return child.stdout.trim()
+}
+
 test('a second process cannot open a database another one owns', () => {
-  assert.equal(code(() => openStore({ path })), 'store_locked')
+  assert.equal(openInChild(path), 'store_locked')
   store.close()
-  openStore({ path }).close()
+  assert.equal(openInChild(path), 'opened')
   store = openStore({ path, clock: () => now })
+})
+
+test('a prefix queue matches by characters, not bytes', () => {
+  const id = store.ingest(incident('P1', { queue: '🔥/checkout' }), source).task.id
+  assert.equal(store.claim({ queue: '🔥/' }, A)?.id, id)
 })
 
 test('a reader resumes from its cursor after the hub is killed', () => {
