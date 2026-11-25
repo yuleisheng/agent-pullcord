@@ -2,7 +2,7 @@
 
 A small, headless, self-hosted service between event sources and coding agents. It turns events from services such as PagerDuty and GitHub into tasks. Any agent can claim a task under a fenced lease, work it, and settle it, so two agents never act on the same event.
 
-Status: early. The HTTP server can list tasks, claim them, and perform holder writes. Source webhooks, event watching, the agent CLI, and MCP aren't implemented yet. See [docs/PRD.md](docs/PRD.md) for the design.
+Status: early. The HTTP server supports task reads and writes and event watching. Source webhooks, the agent CLI, and MCP aren't implemented yet. See [docs/PRD.md](docs/PRD.md) for the design.
 
 ## Run the HTTP server locally
 
@@ -24,7 +24,7 @@ From a shell with that same key, list tasks:
 printf 'Authorization: Bearer %s\n' "$PULLCORD_KEY" | curl --fail-with-body -H @- http://127.0.0.1:7337/tasks
 ```
 
-A new database returns an empty list. Use an existing task-store database to read populated tasks. The global event cursor appears only for keys with both `"*"` queue access and the `events` action, in addition to `read`. The event endpoint is not implemented yet.
+A new database returns an empty list. Use an existing task-store database to read populated tasks. The global event cursor appears only for keys with both `"*"` queue access and the `events` action, in addition to `read`. Save that cursor and call `GET /events?after=<cursor>&wait=30` with an all-queue `events` key to follow changes.
 
 The server listens on loopback by default; use TLS at a reverse proxy before exposing it outside the machine. Keys are loaded at startup. To revoke a key, remove its entry from the file and restart the server.
 
