@@ -2,7 +2,7 @@
 
 A small, headless, self-hosted service between event sources and coding agents. It turns events from services such as PagerDuty and GitHub into tasks. Any agent can claim a task under a fenced lease, work it, and settle it, so two agents never act on the same event.
 
-Status: early. The HTTP server supports signed source webhooks, task reads and writes, and event watching. The agent CLI and MCP aren't implemented yet. See [docs/PRD.md](docs/PRD.md) for the design.
+Status: early. The server supports signed source webhooks, task reads and writes, event watching, and Streamable HTTP MCP at `/mcp`. The agent CLI isn't implemented yet. See [docs/PRD.md](docs/PRD.md) for the design.
 
 ## Run the HTTP server locally
 
