@@ -82,18 +82,22 @@ A **memo** is keyed by (`task_id`, `key`) and holds a JSON value.
 | `ready` | claim | `claimed` (epoch + 1, attempts + 1) | an agent with the queue's claim scope |
 | `claimed` | renew | `claimed` (lease extended) | the holder, with the current epoch |
 | `claimed` | complete | `completed` | the holder, with the current epoch |
-| `claimed` | release | `ready` | the holder, with the current epoch |
+| `claimed` | release | `ready` (attempts − 1) | the holder, with the current epoch |
 | `claimed` | fail, retryable, attempts < max | `ready` | the holder, with the current epoch |
 | `claimed` | fail, not retryable or attempts = max | `failed` | the holder, with the current epoch |
-| `claimed` | block | `blocked` (the claim ends) | the holder, with the current epoch |
+| `claimed` | block | `blocked` (the claim ends; attempts − 1) | the holder, with the current epoch |
+| `claimed` | lease expires, attempts = max | `failed` | the hub |
 | `claimed` | lease expires, `retry: safe`, attempts < max | `ready` | the hub |
-| `claimed` | lease expires, `retry: safe`, attempts = max | `failed` | the hub |
-| `claimed` | lease expires, `retry: manual` | `interrupted` | the hub |
+| `claimed` | lease expires, `retry: manual`, attempts < max | `interrupted` | the hub |
 | `blocked` | unblock | `ready` | a person or an admin key |
 | `interrupted` | requeue | `ready` | a person or an admin key |
 | any state that isn't terminal | cancel | `canceled` | an admin key, or the source (for example, PagerDuty resolves the incident) |
 
 `completed`, `failed`, and `canceled` are terminal.
+
+A claim counts an attempt. A release or a block gives it back, because the agent handed the task back instead of trying and failing. This keeps every `ready` task below `max_attempts`, so a claim never pushes `attempts` past it.
+
+Defaults: `retry: manual`, `max_attempts` 3, and a lease of 15 minutes. A lease can be 1 second to 1 hour, and the holder renews it.
 
 ### Invariants
 
@@ -105,7 +109,7 @@ These are the expectations tests are written from. Change one only through a rev
 4. **Manual tasks never retry themselves.** After its lease expires, a `retry: manual` task reaches `ready` only through a requeue by a person or an admin key.
 5. **Bounded attempts.** `attempts` never exceeds `max_attempts`. A task that runs out of attempts ends in `failed`, not `ready`.
 6. **Idempotent ingest.** Any number of deliveries of the same (source, dedupe key), concurrent or not, create at most one task.
-7. **Exactly-once writes.** A write repeated with the same `request_id` returns the first result and appends no event.
+7. **Exactly-once writes.** A successful write repeated with the same `request_id` by the same actor returns the first result and appends no event. A failed write, or a claim that found nothing, isn't recorded, so repeating it runs it again. Reusing a `request_id` for a different write fails with `request_id_reused`.
 8. **State matches the log.** Every state change appends exactly one event in the same transaction. Replaying the events from the start reproduces every task's current state.
 9. **Complete cursor.** `GET /events?after=c` returns every event with `seq > c`, in order, with no gaps. This holds across a hub restart.
 10. **First memo wins.** Once a memo key has a value, later writes to that key return the stored value and change nothing.
@@ -218,4 +222,3 @@ Each check runs against the built package, a real `serve` process, through its H
 ## Open questions
 
 1. Should an admin be able to reopen a `failed` task, or should a new task be created instead? v1 keeps terminal states final.
-2. The default lease length and `max_attempts` for each task kind.
