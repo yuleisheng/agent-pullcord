@@ -1,0 +1,126 @@
+name: Codex review draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Open pull request number
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: codex-review-draft
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    if: github.ref == 'refs/heads/main' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      base: ${{ steps.revision.outputs.base }}
+      head: ${{ steps.revision.outputs.head }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Check out the exact PR head
+        id: revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pull_request }}
+        run: |
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'Enter a positive integer PR number.' >&2
+            exit 1
+          fi
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")
+          jq -e '.state == "open" and .base.ref == "main"' <<< "$pr" >/dev/null
+          base=$(jq -er '.base.sha' <<< "$pr")
+          head=$(jq -er '.head.sha' <<< "$pr")
+          git fetch --no-tags --depth=1 origin "refs/pull/$PR_NUMBER/head"
+          test "$(git rev-parse FETCH_HEAD)" = "$head"
+          git checkout --detach "$head"
+          printf 'base=%s\nhead=%s\n' "$base" "$head" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22.18.0'
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  draft:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: codex-review
+    env:
+      PR_NUMBER: ${{ inputs.pull_request }}
+      BASE: ${{ needs.checks.outputs.base }}
+      HEAD: ${{ needs.checks.outputs.head }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare review input without checking out PR code
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")
+          jq -e --arg base "$BASE" --arg head "$HEAD" \
+            '.state == "open" and .base.ref == "main" and .base.sha == $base and .head.sha == $head' \
+            <<< "$pr" >/dev/null
+          git fetch --no-tags origin main "refs/pull/$PR_NUMBER/head:refs/codex-review/head"
+          test "$(git rev-parse refs/codex-review/head)" = "$HEAD"
+          git merge-base --is-ancestor "$BASE" "$(git rev-parse refs/remotes/origin/main)"
+          dir="$RUNNER_TEMP/review-context"
+          mkdir "$dir"
+          git show "$BASE:docs/code-review.md" > "$dir/guide"
+          git show "$BASE:docs/PRD.md" > "$dir/prd"
+          git diff --no-ext-diff --no-textconv -U15 "$BASE...$HEAD" -- > "$dir/diff"
+          jq --arg base "$BASE" --arg head "$HEAD" \
+            --rawfile guide "$dir/guide" --rawfile prd "$dir/prd" --rawfile diff "$dir/diff" \
+            '{base: $base, head: $head, guide: $guide, base_prd: $prd, pr: {title, body}, diff: $diff}' \
+            <<< "$pr" > "$dir/input.json"
+          if (( $(wc -c < "$dir/input.json") > 250000 )); then
+            echo 'Review input is too large; no draft generated.' >&2
+            exit 1
+          fi
+      - name: Install pinned Codex CLI
+        run: npm install --global --ignore-scripts @openai/codex@0.163.0
+      - name: Prepare the hosted Ubuntu sandbox
+        run: |
+          for setting in kernel.unprivileged_userns_clone=1 kernel.apparmor_restrict_unprivileged_userns=0; do
+            current=$(sysctl -n "${setting%%=*}" 2>/dev/null || true)
+            if [[ -n "$current" && "$current" != "${setting#*=}" ]]; then
+              sudo sysctl -w "$setting"
+            fi
+          done
+          setpriv --no-new-privs -- unshare --user --map-root-user --net true
+      - name: Generate review draft with ChatGPT authentication
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: setpriv --no-new-privs -- bash .github/scripts/codex-review-draft.sh
+      - name: Show draft for the verified revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" | \
+            jq -e --arg base "$BASE" --arg head "$HEAD" \
+            '.state == "open" and .base.ref == "main" and .base.sha == $base and .head.sha == $head' >/dev/null; then
+            echo 'The PR changed during review. Rerun for the current revision.' >&2
+            exit 1
+          fi
+          {
+            printf '## Codex review draft for PR #%s\n\n' "$PR_NUMBER"
+            sed 's/^/    /' "$RUNNER_TEMP/codex-review-draft.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
