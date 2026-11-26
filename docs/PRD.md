@@ -193,7 +193,7 @@ Webhooks need a public HTTPS address. v1 documents running the hub behind a reve
 
 ## Acceptance checks
 
-Run `npm run test:acceptance`. Each check packs and installs the package as part of the suite, then talks to a real installed `pullcord serve` process through its HTTP API or CLI. It uses a temporary database, fake senders for each source, and no real credentials.
+Run `npm run test:acceptance`. The suite packs and installs the package, then talks to a real installed `pullcord serve` process through HTTP, MCP, or the CLI. It uses temporary databases, fake senders for each source, and no real credentials.
 
 ### A PagerDuty incident becomes one task
 - **Reach it:** a signed POST to `/ingest/pagerduty` with a fixture based on PagerDuty's documented v3 payload.
@@ -214,6 +214,13 @@ Run `npm run test:acceptance`. Each check packs and installs the package as part
 ### A watcher survives a hub restart
 - **Reach it:** with an all-queue key that has `read` and `events`, read the cursor, make changes, kill the hub with `kill -9`, restart it, then call `GET /events?after=<cursor>`.
 - **Expect:** every event since the cursor, in order, with no gaps and no duplicates.
+
+### Two webhook sources, two agents, and a restarted watcher
+- **Reach it:** send duplicate deliveries concurrently for each provider. Two agents with distinct keys race for the GitHub task over HTTP and MCP. Save the watcher's cursor after the claim. Advance the clock to the lease deadline and try the original holder's write before reading or reclaiming the task. The other agent reclaims and completes the GitHub task, and the first agent completes the PagerDuty task. Kill and restart the hub on the same database and redeliver both webhooks.
+- **Expect:** one task per provider resource, one winner in the race, `claim_lost` with no changes from the expired holder, and both tasks completed. The watcher resumes from its saved cursor, gets the exact unseen events in order, then gets an empty page at the new cursor.
+- **Fixture set v1:** abridged synthetic payloads, not captured traffic. The timestamps match the harness's initial clock (`2024-10-27T03:33:20Z`). The sender signs the exact UTF-8 file contents with fake secrets and uses provider delivery headers. Fixture URLs use `.test`; all test requests go to the installed hub on loopback.
+  - [PagerDuty `incident.triggered`](../test/fixtures/webhooks/v1/pagerduty-incident-triggered.json): [v3 envelope](https://docs.pagerduty.com/developer/webhooks-overview#webhook-payload), `X-Webhook-Id` and `X-Webhook-Subscription`, and [the `v1=` signature](https://docs.pagerduty.com/developer/verifying-webhook-signatures).
+  - [GitHub `issues` / `opened`](../test/fixtures/webhooks/v1/github-issues-opened.json): [issue payload](https://docs.github.com/en/webhooks/webhook-events-and-payloads#issues) and [delivery headers](https://docs.github.com/en/webhooks/webhook-events-and-payloads#delivery-headers). After restart, the test also sends the unchanged signed body under a different `X-GitHub-Delivery` GUID to verify that dedupe follows the issue ID.
 
 ### Generated sequences
 - **Reach it:** random sequences of operations from several agents, with an injectable clock, checking every invariant after each step.
