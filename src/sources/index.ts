@@ -28,9 +28,12 @@ export async function verifySourceDelivery(
   return (now) => {
     const payload = decodeSourceBody(body)
     switch (provider) {
-      case 'pagerduty': return pagerDuty(payload, now)
-      case 'github': return gitHub(payload, headers.get('x-github-event'), now)
-      case 'generic': return generic(payload, now)
+      case 'pagerduty':
+        return pagerDuty(payload, now)
+      case 'github':
+        return gitHub(payload, headers.get('x-github-event'), now)
+      case 'generic':
+        return generic(payload, now)
     }
   }
 }

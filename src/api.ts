@@ -4,7 +4,26 @@ import { SourceError, verifySourceDelivery } from './sources/index.ts'
 import { MAX_LEASE_MS, MIN_LEASE_MS, StoreError, type ErrorCode } from './store-contract.ts'
 import type { Labels, Store, Task, TaskEvent, TaskState, Writer } from './store.ts'
 
-type TaskStore = Pick<Store, 'tasks' | 'task' | 'taskQueue' | 'events' | 'claim' | 'renew' | 'complete' | 'fail' | 'release' | 'block' | 'log' | 'memo' | 'unblock' | 'requeue' | 'cancel' | 'ingest' | 'cancelFromSource'>
+type TaskStore = Pick<
+  Store,
+  | 'tasks'
+  | 'task'
+  | 'taskQueue'
+  | 'events'
+  | 'claim'
+  | 'renew'
+  | 'complete'
+  | 'fail'
+  | 'release'
+  | 'block'
+  | 'log'
+  | 'memo'
+  | 'unblock'
+  | 'requeue'
+  | 'cancel'
+  | 'ingest'
+  | 'cancelFromSource'
+>
 
 type HolderAction = (typeof HOLDER_ACTIONS)[number]
 type OtherWrite = 'log' | 'memo' | 'unblock' | 'requeue' | 'cancel'
@@ -16,7 +35,15 @@ const INGEST_WINDOW_LIMIT = 120
 const MAX_WAIT_SECONDS = 30
 const POLL_MS = 250
 
-const STATES = ['ready', 'claimed', 'blocked', 'interrupted', 'completed', 'failed', 'canceled'] as const satisfies readonly TaskState[]
+const STATES = [
+  'ready',
+  'claimed',
+  'blocked',
+  'interrupted',
+  'completed',
+  'failed',
+  'canceled',
+] as const satisfies readonly TaskState[]
 const STORE_STATUS: Record<ErrorCode, number> = {
   not_found: 404,
   claim_lost: 409,
@@ -44,7 +71,9 @@ class ApiError extends Error {
 }
 
 function keyring(config: unknown): Map<string, Agent> {
-  return new Map(parseKeyConfig(config).map(({ agent, sha256, queues, can }) => [sha256, { actor: `agent:${agent}`, queues, can }]))
+  return new Map(
+    parseKeyConfig(config).map(({ agent, sha256, queues, can }) => [sha256, { actor: `agent:${agent}`, queues, can }]),
+  )
 }
 
 async function authenticate(request: Request, keys: Map<string, Agent>): Promise<Agent> {
@@ -63,7 +92,9 @@ function requireAction(agent: Agent, action: Action): void {
 }
 
 function covers(agent: Agent, queue: string): boolean {
-  return agent.queues.some((scope) => scope === '*' || (scope.endsWith('/') ? queue.startsWith(scope) : queue === scope))
+  return agent.queues.some(
+    (scope) => scope === '*' || (scope.endsWith('/') ? queue.startsWith(scope) : queue === scope),
+  )
 }
 
 function requireQueue(agent: Agent, selector: string): void {
@@ -117,7 +148,8 @@ function waitSeconds(value: unknown): number {
 function leaseMs(value: unknown): number | undefined {
   if (value === undefined) return undefined
   const ms = integer(value, 'lease') * 1000
-  if (ms < MIN_LEASE_MS || ms > MAX_LEASE_MS) invalid(`lease must be ${MIN_LEASE_MS / 1000} to ${MAX_LEASE_MS / 1000} seconds.`)
+  if (ms < MIN_LEASE_MS || ms > MAX_LEASE_MS)
+    invalid(`lease must be ${MIN_LEASE_MS / 1000} to ${MAX_LEASE_MS / 1000} seconds.`)
   return ms
 }
 
@@ -179,11 +211,13 @@ function listFilter(query: URLSearchParams): { queue?: string; state?: TaskState
   const state = STATES.find((known) => known === stateName)
   if (stateName !== null && state === undefined) invalid(`Use one of these states: ${STATES.join(', ')}.`)
   const entries = query.getAll('label')
-  const labels = Object.fromEntries(entries.map((label) => {
-    const split = label.indexOf('=')
-    if (split < 1) invalid('Write each label filter as label=key=value.')
-    return [label.slice(0, split), label.slice(split + 1)]
-  }))
+  const labels = Object.fromEntries(
+    entries.map((label) => {
+      const split = label.indexOf('=')
+      if (split < 1) invalid('Write each label filter as label=key=value.')
+      return [label.slice(0, split), label.slice(split + 1)]
+    }),
+  )
   if (Object.keys(labels).length !== entries.length) invalid('Specify each label filter once.')
   return { queue, state, labels }
 }
@@ -235,7 +269,8 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 async function watch(store: TaskStore, agent: Agent, query: URLSearchParams, signal: AbortSignal) {
-  if (!canWatch(agent)) throw new ApiError(403, 'forbidden', 'Use a key with the events action and the all-queue (*) grant.')
+  if (!canWatch(agent))
+    throw new ApiError(403, 'forbidden', 'Use a key with the events action and the all-queue (*) grant.')
   const after = queryNumber(query.get('after'), 'after')
   const deadline = performance.now() + waitSeconds(queryNumber(query.get('wait'), 'wait')) * 1000
   for (;;) {
@@ -251,14 +286,18 @@ function claimFilter(store: TaskStore, agent: Agent, body: Record<string, unknow
   const lease = leaseMs(body.lease)
   if (body.id !== undefined) {
     const id = integer(body.id, 'id')
-    if (id < 1 || body.queue !== undefined || body.labels !== undefined) invalid('Supply a positive integer id without queue or labels.')
+    if (id < 1 || body.queue !== undefined || body.labels !== undefined)
+      invalid('Supply a positive integer id without queue or labels.')
     requireTaskQueue(store, agent, id)
     return { id, leaseMs: lease }
   }
   const queue = nonempty(body.queue, 'queue')
   requireQueue(agent, queue)
   const { labels } = body
-  if (labels !== undefined && (!isObject(labels) || !Object.values(labels).every((value) => typeof value === 'string'))) {
+  if (
+    labels !== undefined &&
+    (!isObject(labels) || !Object.values(labels).every((value) => typeof value === 'string'))
+  ) {
     invalid('labels must map strings to strings.')
   }
   return { queue, labels: labels as Labels | undefined, leaseMs: lease }
@@ -281,7 +320,13 @@ async function claimTask(store: TaskStore, agent: Agent, request: Request): Prom
   throw new ApiError(409, 'nothing_ready', 'No matching task is ready. Try claiming again later.')
 }
 
-async function holderWrite(store: TaskStore, agent: Agent, action: HolderAction, part: string, request: Request): Promise<Task> {
+async function holderWrite(
+  store: TaskStore,
+  agent: Agent,
+  action: HolderAction,
+  part: string,
+  request: Request,
+): Promise<Task> {
   requireAction(agent, action)
   const id = taskId(part)
   const body = await jsonBody(request)
@@ -354,7 +399,8 @@ function createIngest(store: TaskStore, config: unknown) {
       source.until = time + INGEST_WINDOW_MS
       source.used = 0
     }
-    if (source.used >= INGEST_WINDOW_LIMIT) throw new ApiError(429, 'rate_limited', 'This source reached its delivery limit. Retry in a minute.')
+    if (source.used >= INGEST_WINDOW_LIMIT)
+      throw new ApiError(429, 'rate_limited', 'This source reached its delivery limit. Retry in a minute.')
     source.used++
     request.signal.throwIfAborted()
     const event = readEvent(Date.now())
@@ -368,7 +414,12 @@ function createIngest(store: TaskStore, config: unknown) {
   }
 }
 
-export function createApi(store: TaskStore, config: unknown, sources: unknown = [], allowsMcpOrigin?: (origin: string) => boolean) {
+export function createApi(
+  store: TaskStore,
+  config: unknown,
+  sources: unknown = [],
+  allowsMcpOrigin?: (origin: string) => boolean,
+) {
   const keys = keyring(config)
   const ingest = createIngest(store, sources)
   const mcp = createMcp(readJson)
@@ -379,7 +430,8 @@ export function createApi(store: TaskStore, config: unknown, sources: unknown = 
       if (request.method === 'POST' && webhook) return await ingest(request, webhook[1])
       if (pathname === '/mcp') {
         const origin = request.headers.get('origin')
-        if (origin !== null && !allowsMcpOrigin?.(origin)) throw new ApiError(403, 'forbidden', 'Use the hub’s bound origin or configured public origin.')
+        if (origin !== null && !allowsMcpOrigin?.(origin))
+          throw new ApiError(403, 'forbidden', 'Use the hub’s bound origin or configured public origin.')
         const agent = await authenticate(request, keys)
         return await mcp(request, agent.actor, handle)
       }
@@ -410,7 +462,13 @@ export function createApi(store: TaskStore, config: unknown, sources: unknown = 
           const [, part, action] = write
           const holder = HOLDER_ACTIONS.find((known) => known === action)
           if (holder) return json(taskJson(await holderWrite(store, agent, holder, part, request)))
-          if (action === 'log' || action === 'memo' || action === 'unblock' || action === 'requeue' || action === 'cancel') {
+          if (
+            action === 'log' ||
+            action === 'memo' ||
+            action === 'unblock' ||
+            action === 'requeue' ||
+            action === 'cancel'
+          ) {
             return json(await otherWrite(store, agent, action, part, request))
           }
         }
@@ -422,7 +480,10 @@ export function createApi(store: TaskStore, config: unknown, sources: unknown = 
         const status = error instanceof ApiError ? error.status : STORE_STATUS[error.code]
         return json({ code: error.code, message: error.message }, status)
       }
-      return json({ code: 'internal_error', message: 'The hub could not handle the request. Try again or contact its operator.' }, 500)
+      return json(
+        { code: 'internal_error', message: 'The hub could not handle the request. Try again or contact its operator.' },
+        500,
+      )
     }
   }
   return handle

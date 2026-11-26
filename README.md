@@ -62,7 +62,10 @@ Use the returned task ID instead of `1` if you started with an existing database
 ## Checks
 
 ```sh
-npm run typecheck && npm test && npm run test:acceptance
+npm ci
+npm run check
 ```
+
+Run `npm run format` to apply Prettier formatting. `npm run check` runs lint, the format check, type checking, source tests, and package acceptance.
 
 The acceptance suite installs the tarball offline and runs the installed `pullcord serve` against temporary databases and fake webhook senders. It does not publish the package.

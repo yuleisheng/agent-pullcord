@@ -48,7 +48,10 @@ export class Client {
     let response: Response
     try {
       response = await fetch(new URL(path, this.#url), {
-        method: body ? 'POST' : 'GET', headers, body: body && JSON.stringify(body), redirect: 'error',
+        method: body ? 'POST' : 'GET',
+        headers,
+        body: body && JSON.stringify(body),
+        redirect: 'error',
         signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
       })
     } catch {
@@ -60,7 +63,11 @@ export class Client {
       responseBody = await response.text()
     } catch {
       signal?.throwIfAborted()
-      throw new CliError('network_error', 'The connection to the hub ended before its response was read. Try again.', response.status)
+      throw new CliError(
+        'network_error',
+        'The connection to the hub ended before its response was read. Try again.',
+        response.status,
+      )
     }
     let data: unknown
     try {
@@ -69,8 +76,14 @@ export class Client {
       throw new CliError('invalid_response', 'The hub did not return JSON.', response.status)
     }
     if (!response.ok) {
-      if (data && typeof data === 'object' && 'code' in data && 'message' in data &&
-          typeof data.code === 'string' && typeof data.message === 'string') {
+      if (
+        data &&
+        typeof data === 'object' &&
+        'code' in data &&
+        'message' in data &&
+        typeof data.code === 'string' &&
+        typeof data.message === 'string'
+      ) {
         throw new CliError(data.code, data.message, response.status)
       }
       throw new CliError('invalid_response', `The hub returned HTTP ${response.status}.`, response.status)
@@ -134,7 +147,11 @@ export class Client {
     if (!stat.isDirectory() || stat.mode & 0o077 || (process.getuid && stat.uid !== process.getuid())) {
       invalid('The pullcord state directory must be private and owned by you.')
     }
-    const scope = createHash('sha256').update(this.#url.href).update('\0').update(this.#key ?? '').digest('hex')
+    const scope = createHash('sha256')
+      .update(this.#url.href)
+      .update('\0')
+      .update(this.#key ?? '')
+      .digest('hex')
     return join(dir, `${scope}-${id}.epoch`)
   }
 }

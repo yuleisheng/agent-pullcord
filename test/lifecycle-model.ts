@@ -22,10 +22,19 @@ type Op =
 
 const agent = fc.integer({ min: 0, max: AGENTS.length - 1 })
 const key = fc.integer({ min: 0, max: KEYS - 1 })
-const held = (t: 'renew' | 'complete' | 'release' | 'block') => fc.record({ t: fc.constant(t), agent, key, stale: fc.boolean() })
+const held = (t: 'renew' | 'complete' | 'release' | 'block') =>
+  fc.record({ t: fc.constant(t), agent, key, stale: fc.boolean() })
 export const operation: fc.Arbitrary<Op> = fc.oneof(
-  fc.record({ t: fc.constant('ingest' as const), key, retry: fc.constantFrom('safe' as const, 'manual' as const), max: fc.integer({ min: 1, max: 3 }) }),
-  { arbitrary: fc.record({ t: fc.constant('claim' as const), agent, lease: fc.integer({ min: 10_000, max: 50_000 }) }), weight: 3 },
+  fc.record({
+    t: fc.constant('ingest' as const),
+    key,
+    retry: fc.constantFrom('safe' as const, 'manual' as const),
+    max: fc.integer({ min: 1, max: 3 }),
+  }),
+  {
+    arbitrary: fc.record({ t: fc.constant('claim' as const), agent, lease: fc.integer({ min: 10_000, max: 50_000 }) }),
+    weight: 3,
+  },
   held('renew'),
   held('complete'),
   held('release'),
@@ -52,8 +61,13 @@ export interface Call {
   value: unknown
 }
 
-export type Outcome = { ok: { id: number; state: TaskState; epoch: number } | { text: string } | { value: unknown } | null } | { code: string }
-export type TaskView = Pick<Task, 'id' | 'state' | 'holder' | 'epoch' | 'attempts' | 'maxAttempts' | 'retry' | 'leaseExpiresAt' | 'readyAt'> & {
+export type Outcome =
+  | { ok: { id: number; state: TaskState; epoch: number } | { text: string } | { value: unknown } | null }
+  | { code: string }
+export type TaskView = Pick<
+  Task,
+  'id' | 'state' | 'holder' | 'epoch' | 'attempts' | 'maxAttempts' | 'retry' | 'leaseExpiresAt' | 'readyAt'
+> & {
   memos: Record<string, unknown>
 }
 
@@ -127,8 +141,17 @@ export class Model {
   #last: Call | undefined
 
   call(step: Exclude<Op, { t: 'ingest' | 'advance' }>, index: number, leaseUnit = 1): Call {
-    const fallback: Call = { t: 'claim', actor: AGENTS[0], id: 0, epoch: 1, lease: 10_000, retry: false,
-      requestId: `r${index}`, text: `note ${index}`, value: null }
+    const fallback: Call = {
+      t: 'claim',
+      actor: AGENTS[0],
+      id: 0,
+      epoch: 1,
+      lease: 10_000,
+      retry: false,
+      requestId: `r${index}`,
+      text: `note ${index}`,
+      value: null,
+    }
     if (step.t === 'repeat') return this.#last ?? fallback
     if (step.t === 'reuse') return this.#last ? changeOneField(this.#last, leaseUnit) : fallback
     if (step.t === 'other-actor') {
@@ -136,20 +159,33 @@ export class Model {
       return { ...this.#last, actor: AGENTS[(AGENTS.indexOf(this.#last.actor) + 1) % AGENTS.length] }
     }
     const actor = AGENTS['agent' in step ? step.agent : 0]
-    const id = 'key' in step ? this.#ids.get(step.key) ?? 99 : 0
+    const id = 'key' in step ? (this.#ids.get(step.key) ?? 99) : 0
     const remembered = this.#remembered.get(`${actor}/${id}`) ?? 1
-    return this.#last = {
-      ...fallback, t: step.t, actor, id,
+    return (this.#last = {
+      ...fallback,
+      t: step.t,
+      actor,
+      id,
       epoch: 'stale' in step && step.stale ? (remembered > 1 ? remembered - 1 : 2) : remembered,
       lease: 'lease' in step ? Math.floor(step.lease / leaseUnit) * leaseUnit : 30_000,
       retry: 'retry' in step && step.retry,
       value: 'value' in step ? step.value : null,
-    }
+    })
   }
 
   ingest(key: number, retry: 'safe' | 'manual', max: number, now: number): boolean {
     if (this.#ids.has(key)) return false
-    this.tasks.push({ state: 'ready', holder: null, epoch: 0, attempts: 0, max, retry, lease: null, readyAt: now, memos: {} })
+    this.tasks.push({
+      state: 'ready',
+      holder: null,
+      epoch: 0,
+      attempts: 0,
+      max,
+      retry,
+      lease: null,
+      readyAt: now,
+      memos: {},
+    })
     this.#ids.set(key, this.tasks.length)
     return true
   }
@@ -188,7 +224,14 @@ export class Model {
       })
       if (index < 0) return { ok: null }
       const task = this.tasks[index]!
-      Object.assign(task, { state: 'claimed', holder: call.actor, epoch: task.epoch + 1, attempts: task.attempts + 1, lease: now + call.lease, readyAt: null })
+      Object.assign(task, {
+        state: 'claimed',
+        holder: call.actor,
+        epoch: task.epoch + 1,
+        attempts: task.attempts + 1,
+        lease: now + call.lease,
+        readyAt: null,
+      })
       return this.#ok(index + 1)
     }
     const task = this.tasks[call.id - 1]
@@ -214,7 +257,8 @@ export class Model {
         if (!Object.hasOwn(task.memos, MEMO_KEY)) task.memos[MEMO_KEY] = call.value
         return { ok: { value: task.memos[MEMO_KEY] } }
     }
-    if (task.state !== 'claimed' || task.holder !== call.actor || task.epoch !== call.epoch) return { code: 'claim_lost' }
+    if (task.state !== 'claimed' || task.holder !== call.actor || task.epoch !== call.epoch)
+      return { code: 'claim_lost' }
     switch (call.t) {
       case 'renew':
         task.lease = now + call.lease
@@ -245,12 +289,27 @@ function replay(events: TaskEvent[]): Map<number, Omit<ModelTask, 'max' | 'retry
   const tasks = new Map<number, Omit<ModelTask, 'max' | 'retry'>>()
   for (const event of events) {
     const data = event.data as { epoch?: number; leaseExpiresAt?: number | null; key?: string; value?: unknown }
-    const task = tasks.get(event.taskId) ?? { state: 'ready', holder: null, epoch: 0, attempts: 0, lease: null, readyAt: event.at, memos: {} }
+    const task = tasks.get(event.taskId) ?? {
+      state: 'ready',
+      holder: null,
+      epoch: 0,
+      attempts: 0,
+      lease: null,
+      readyAt: event.at,
+      memos: {},
+    }
     switch (event.type) {
       case 'task.created':
         break
       case 'task.claimed':
-        Object.assign(task, { state: 'claimed', holder: event.actor, epoch: data.epoch, lease: data.leaseExpiresAt, attempts: task.attempts + 1, readyAt: null })
+        Object.assign(task, {
+          state: 'claimed',
+          holder: event.actor,
+          epoch: data.epoch,
+          lease: data.leaseExpiresAt,
+          attempts: task.attempts + 1,
+          readyAt: null,
+        })
         break
       case 'task.renewed':
         task.lease = data.leaseExpiresAt ?? null
@@ -262,8 +321,14 @@ function replay(events: TaskEvent[]): Map<number, Omit<ModelTask, 'max' | 'retry
         task.memos[data.key!] = data.value
         break
       default:
-        Object.assign(task, { state: event.to, holder: null, lease: null, readyAt: event.to === 'ready' ? event.at : null })
-        if (event.type === 'task.released' || event.type === 'task.blocked' || event.type === 'task.requeued') task.attempts -= 1
+        Object.assign(task, {
+          state: event.to,
+          holder: null,
+          lease: null,
+          readyAt: event.to === 'ready' ? event.at : null,
+        })
+        if (event.type === 'task.released' || event.type === 'task.blocked' || event.type === 'task.requeued')
+          task.attempts -= 1
     }
     tasks.set(event.taskId, task)
   }
@@ -281,26 +346,36 @@ export function checkInvariants(model: Model, now: number, tasks: TaskView[], ev
   assert.equal(tasks.length, model.tasks.length, 'one task per dedupe key')
   for (const task of tasks) {
     const { max, retry, ...expected } = model.tasks[task.id - 1]!
-    const observed = { state: task.state, holder: task.holder, epoch: task.epoch, attempts: task.attempts,
-      lease: task.leaseExpiresAt, readyAt: task.readyAt, memos: task.memos }
-    assert.deepEqual(
-      observed, expected,
-      `task ${task.id} matches the model`,
-    )
+    const observed = {
+      state: task.state,
+      holder: task.holder,
+      epoch: task.epoch,
+      attempts: task.attempts,
+      lease: task.leaseExpiresAt,
+      readyAt: task.readyAt,
+      memos: task.memos,
+    }
+    assert.deepEqual(observed, expected, `task ${task.id} matches the model`)
     assert.deepEqual([task.maxAttempts, task.retry], [max, retry])
     assert.ok(task.attempts >= 0 && task.attempts <= task.maxAttempts, 'attempts stay within bounds')
-    assert.equal(task.state === 'claimed', task.holder !== null && task.leaseExpiresAt! > now, 'only a live claim has a holder')
+    assert.equal(
+      task.state === 'claimed',
+      task.holder !== null && task.leaseExpiresAt! > now,
+      'only a live claim has a holder',
+    )
 
     const own = events.filter((e) => e.taskId === task.id)
     assert.equal(own[0]?.from, null)
-    for (let i = 1; i < own.length; i++) assert.equal(own[i]!.from, own[i - 1]!.to, `task ${task.id}'s events form a chain`)
+    for (let i = 1; i < own.length; i++)
+      assert.equal(own[i]!.from, own[i - 1]!.to, `task ${task.id}'s events form a chain`)
     assert.equal(own.at(-1)!.to, task.state, `task ${task.id}'s last event matches its state`)
     const replayed = replayedTasks.get(task.id)
-    assert.deepEqual(
-      replayed, observed,
-      `replaying task ${task.id}'s events reproduces its state`,
-    )
+    assert.deepEqual(replayed, observed, `replaying task ${task.id}'s events reproduces its state`)
     const finished = own.findIndex((e) => TERMINAL.has(e.to))
-    if (finished >= 0) assert.ok(own.slice(finished + 1).every((e) => e.from === e.to), 'a finished task never changes state')
+    if (finished >= 0)
+      assert.ok(
+        own.slice(finished + 1).every((e) => e.from === e.to),
+        'a finished task never changes state',
+      )
   }
 }

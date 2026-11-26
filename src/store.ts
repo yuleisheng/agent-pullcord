@@ -78,7 +78,9 @@ export interface Holder extends Writer {
   epoch: number
 }
 
-type ClaimFilter = ({ queue: string; labels?: Labels; id?: never } | { id: number; queue?: never; labels?: never }) & { leaseMs?: number }
+type ClaimFilter = ({ queue: string; labels?: Labels; id?: never } | { id: number; queue?: never; labels?: never }) & {
+  leaseMs?: number
+}
 
 const DEFAULT_MAX_ATTEMPTS = 3
 const HUB: Writer = { actor: 'pullcord' }
@@ -178,7 +180,9 @@ interface Row {
 export function openStore(options: { path: string; clock?: () => number }): Store {
   const db = new DatabaseSync(options.path)
   try {
-    db.exec('PRAGMA busy_timeout = 0; PRAGMA locking_mode = EXCLUSIVE; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;')
+    db.exec(
+      'PRAGMA busy_timeout = 0; PRAGMA locking_mode = EXCLUSIVE; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;',
+    )
     db.exec('BEGIN EXCLUSIVE')
     db.exec(SCHEMA)
     db.exec('COMMIT')
@@ -211,18 +215,26 @@ export class Store {
   /** Creates a ready task, or returns the existing one for the same (source, dedupe key). */
   ingest(input: IngestInput, who: { actor: string }): { task: Task; created: boolean } {
     need(isName(input.queue) && !input.queue.endsWith('/'), 'queue must be a non-empty name that does not end with "/"')
-    for (const field of ['kind', 'source', 'dedupeKey'] as const) need(isName(input[field]), `${field} must be a non-empty string`)
+    for (const field of ['kind', 'source', 'dedupeKey'] as const)
+      need(isName(input[field]), `${field} must be a non-empty string`)
     need(typeof input.title === 'string', 'title must be a string')
     const retry = input.retry ?? 'manual'
     need(retry === 'safe' || retry === 'manual', 'retry must be "safe" or "manual"')
     const maxAttempts = input.maxAttempts ?? DEFAULT_MAX_ATTEMPTS
-    need(Number.isInteger(maxAttempts) && maxAttempts >= 1 && maxAttempts <= 100, 'maxAttempts must be an integer from 1 to 100')
+    need(
+      Number.isInteger(maxAttempts) && maxAttempts >= 1 && maxAttempts <= 100,
+      'maxAttempts must be an integer from 1 to 100',
+    )
     const labels = input.labels ?? {}
     need(isLabels(labels), 'labels must map strings to strings')
     checkActor(who)
 
     return this.#run((now) => {
-      const existing = this.#get('SELECT * FROM tasks WHERE source = ? AND dedupe_key = ?', input.source, input.dedupeKey)
+      const existing = this.#get(
+        'SELECT * FROM tasks WHERE source = ? AND dedupe_key = ?',
+        input.source,
+        input.dedupeKey,
+      )
       if (existing) return { task: toTask(existing), created: false }
       const { lastInsertRowid } = this.#db
         .prepare(
@@ -250,7 +262,15 @@ export class Store {
           now,
         )
       const row = this.#row(Number(lastInsertRowid))
-      this.#event(row.id, 'task.created', who, null, 'ready', { queue: row.queue, source: row.source, dedupeKey: row.dedupe_key }, now)
+      this.#event(
+        row.id,
+        'task.created',
+        who,
+        null,
+        'ready',
+        { queue: row.queue, source: row.source, dedupeKey: row.dedupe_key },
+        now,
+      )
       return { task: toTask(row), created: true }
     })
   }
@@ -266,13 +286,17 @@ export class Store {
       need(isName(queue), 'queue must be a non-empty string')
       need(labels === undefined || isLabels(labels), 'labels must map strings to strings')
     } else {
-      need(Number.isSafeInteger(id) && id > 0 && queue === undefined && labels === undefined, 'use a positive id without queue or labels')
+      need(
+        Number.isSafeInteger(id) && id > 0 && queue === undefined && labels === undefined,
+        'use a positive id without queue or labels',
+      )
     }
     const args = id === undefined ? { queue, labels: sortedLabels(labels), leaseMs } : { leaseMs }
     return this.#write('claim', id ?? null, args, who, (now) => {
-      const row = id === undefined
-        ? this.#rows('ready', queue, 'ready_at, id').find((candidate) => hasLabels(candidate, labels))
-        : this.#get("SELECT * FROM tasks WHERE id = ? AND state = 'ready'", id)
+      const row =
+        id === undefined
+          ? this.#rows('ready', queue, 'ready_at, id').find((candidate) => hasLabels(candidate, labels))
+          : this.#get("SELECT * FROM tasks WHERE id = ? AND state = 'ready'", id)
       if (!row) return null
       return toTask(
         this.#move(row, 'task.claimed', 'claimed', who, now, {
@@ -297,7 +321,9 @@ export class Store {
   complete(id: number, who: Holder & { result?: string }): Task {
     need(who.result === undefined || typeof who.result === 'string', 'result must be a string')
     return this.#writeHolder('complete', id, { result: who.result ?? null }, who, (row, now) => {
-      return toTask(this.#moveAndClearClaim(row, 'task.completed', 'completed', who, now, { result: who.result ?? null }))
+      return toTask(
+        this.#moveAndClearClaim(row, 'task.completed', 'completed', who, now, { result: who.result ?? null }),
+      )
     })
   }
 
@@ -321,7 +347,12 @@ export class Store {
   block(id: number, who: Holder & { reason: string }): Task {
     need(isName(who.reason), 'reason must be a non-empty string')
     return this.#writeHolder('block', id, { reason: who.reason }, who, (row, now) => {
-      return toTask(this.#moveAndClearClaim(row, 'task.blocked', 'blocked', who, now, { attempts: row.attempts - 1, reason: who.reason }))
+      return toTask(
+        this.#moveAndClearClaim(row, 'task.blocked', 'blocked', who, now, {
+          attempts: row.attempts - 1,
+          reason: who.reason,
+        }),
+      )
     })
   }
 
@@ -330,7 +361,9 @@ export class Store {
   }
 
   requeue(id: number, who: Writer): Task {
-    return this.#write('requeue', id, {}, who, (now) => toTask(this.#reopen(id, 'interrupted', 'task.requeued', who, now, (row) => ({ attempts: row.attempts - 1 }))))
+    return this.#write('requeue', id, {}, who, (now) =>
+      toTask(this.#reopen(id, 'interrupted', 'task.requeued', who, now, (row) => ({ attempts: row.attempts - 1 }))),
+    )
   }
 
   cancel(id: number, who: Writer & { reason: string }): Task {
@@ -338,7 +371,10 @@ export class Store {
     return this.#write('cancel', id, { reason: who.reason }, who, (now) => {
       const row = this.#row(id)
       if (TERMINAL.has(row.state)) {
-        throw new StoreError('invalid_transition', `Task ${id} is already ${row.state}. Finished tasks can't be canceled.`)
+        throw new StoreError(
+          'invalid_transition',
+          `Task ${id} is already ${row.state}. Finished tasks can't be canceled.`,
+        )
       }
       return this.#cancel(row, who, now)
     })
@@ -371,10 +407,13 @@ export class Store {
     need(encoded !== undefined, 'value must be JSON')
     return this.#write('memo', id, { key, value: encoded }, who, (now) => {
       const row = this.#row(id)
-      const stored = this.#db.prepare('SELECT value FROM memos WHERE task_id = ? AND key = ?').get(id, key) as { value: string } | undefined
+      const stored = this.#db.prepare('SELECT value FROM memos WHERE task_id = ? AND key = ?').get(id, key) as
+        { value: string } | undefined
       if (stored) return { value: JSON.parse(stored.value) as unknown }
       const parsed: unknown = JSON.parse(encoded)
-      this.#db.prepare('INSERT INTO memos (task_id, key, value, actor, at) VALUES (?, ?, ?, ?, ?)').run(id, key, encoded, who.actor, now)
+      this.#db
+        .prepare('INSERT INTO memos (task_id, key, value, actor, at) VALUES (?, ?, ?, ?, ?)')
+        .run(id, key, encoded, who.actor, now)
       this.#event(id, 'task.memo', who, row.state, row.state, { key, value: parsed }, now)
       return { value: parsed }
     }).value
@@ -388,8 +427,14 @@ export class Store {
   task(id: number): Task & { memos: Record<string, unknown> } {
     return this.#run(() => {
       const row = this.#row(id)
-      const memos = this.#db.prepare('SELECT key, value FROM memos WHERE task_id = ? ORDER BY key').all(id) as { key: string; value: string }[]
-      return { ...toTask(row), memos: Object.fromEntries(memos.map(({ key, value }) => [key, JSON.parse(value) as unknown])) }
+      const memos = this.#db.prepare('SELECT key, value FROM memos WHERE task_id = ? ORDER BY key').all(id) as {
+        key: string
+        value: string
+      }[]
+      return {
+        ...toTask(row),
+        memos: Object.fromEntries(memos.map(({ key, value }) => [key, JSON.parse(value) as unknown])),
+      }
     })
   }
 
@@ -409,9 +454,16 @@ export class Store {
     const after = options.after ?? 0
     const { limit } = options
     need(Number.isSafeInteger(after) && after >= 0, 'after must be a non-negative safe integer')
-    need(limit === undefined || (Number.isInteger(limit) && limit >= 1 && limit <= 1000), 'limit must be an integer from 1 to 1000')
+    need(
+      limit === undefined || (Number.isInteger(limit) && limit >= 1 && limit <= 1000),
+      'limit must be an integer from 1 to 1000',
+    )
     return this.#run(() =>
-      (this.#db.prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?').all(after, limit ?? -1) as unknown as EventRow[]).map(toEvent),
+      (
+        this.#db
+          .prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?')
+          .all(after, limit ?? -1) as unknown as EventRow[]
+      ).map(toEvent),
     )
   }
 
@@ -429,11 +481,24 @@ export class Store {
     }
   }
 
-  #writeHolder(op: string, id: number, args: Record<string, unknown>, who: Holder, fn: (row: Row, now: number) => Task): Task {
+  #writeHolder(
+    op: string,
+    id: number,
+    args: Record<string, unknown>,
+    who: Holder,
+    fn: (row: Row, now: number) => Task,
+  ): Task {
     return this.#write(op, id, { epoch: who.epoch, ...args }, who, (now) => fn(this.#held(id, who, now), now), false)
   }
 
-  #write<T>(op: string, taskId: number | null, args: Record<string, unknown>, who: Writer, fn: (now: number) => T, expireLeases = true): T {
+  #write<T>(
+    op: string,
+    taskId: number | null,
+    args: Record<string, unknown>,
+    who: Writer,
+    fn: (now: number) => T,
+    expireLeases = true,
+  ): T {
     checkActor(who)
     need(who.requestId === undefined || isName(who.requestId), 'requestId must be a non-empty string')
     const write = JSON.stringify({ op, taskId, ...args })
@@ -444,7 +509,10 @@ export class Store {
           .get(who.actor, who.requestId) as { write: string; response: string } | undefined
         if (prior) {
           if (prior.write !== write) {
-            throw new StoreError('request_id_reused', `Request ID ${who.requestId} was already used for another write. Use a new request ID.`)
+            throw new StoreError(
+              'request_id_reused',
+              `Request ID ${who.requestId} was already used for another write. Use a new request ID.`,
+            )
           }
           return JSON.parse(prior.response) as T
         }
@@ -463,22 +531,47 @@ export class Store {
   #expireLeases(now: number): void {
     const expired = this.#all("SELECT * FROM tasks WHERE state = 'claimed' AND lease_expires_at <= ? ORDER BY id", now)
     for (const row of expired) {
-      const to: TaskState = row.retry === 'manual' ? 'interrupted' : row.attempts >= row.max_attempts ? 'failed' : 'ready'
+      const to: TaskState =
+        row.retry === 'manual' ? 'interrupted' : row.attempts >= row.max_attempts ? 'failed' : 'ready'
       const reason = to === 'ready' ? null : `lease held by ${row.holder} expired`
-      this.#moveAndClearClaim(row, 'task.lease_expired', to, HUB, now, { reason }, { holder: row.holder, epoch: row.epoch })
+      this.#moveAndClearClaim(
+        row,
+        'task.lease_expired',
+        to,
+        HUB,
+        now,
+        { reason },
+        { holder: row.holder, epoch: row.epoch },
+      )
     }
   }
 
   #held(id: number, who: Holder, now: number): Row {
     need(Number.isInteger(who.epoch), 'epoch must be an integer')
     const row = this.#row(id)
-    if (row.state !== 'claimed' || row.holder !== who.actor || row.epoch !== who.epoch || row.lease_expires_at === null || row.lease_expires_at <= now) {
-      throw new StoreError('claim_lost', `${who.actor} holds no current claim on task ${id} at epoch ${who.epoch}. Its lease ran out, or the task moved on. Read the task, then claim again if it's ready.`)
+    if (
+      row.state !== 'claimed' ||
+      row.holder !== who.actor ||
+      row.epoch !== who.epoch ||
+      row.lease_expires_at === null ||
+      row.lease_expires_at <= now
+    ) {
+      throw new StoreError(
+        'claim_lost',
+        `${who.actor} holds no current claim on task ${id} at epoch ${who.epoch}. Its lease ran out, or the task moved on. Read the task, then claim again if it's ready.`,
+      )
     }
     return row
   }
 
-  #reopen(id: number, from: TaskState, type: string, who: Writer, now: number, set: (row: Row) => Partial<Row> = () => ({})): Row {
+  #reopen(
+    id: number,
+    from: TaskState,
+    type: string,
+    who: Writer,
+    now: number,
+    set: (row: Row) => Partial<Row> = () => ({}),
+  ): Row {
     const row = this.#row(id)
     if (row.state !== from) throw new StoreError('invalid_transition', `Task ${id} is ${row.state}, not ${from}.`)
     return this.#move(row, type, 'ready', who, now, { reason: null, ...set(row) })
@@ -488,7 +581,15 @@ export class Store {
     return toTask(this.#moveAndClearClaim(row, 'task.canceled', 'canceled', who, now, { reason: who.reason }))
   }
 
-  #moveAndClearClaim(row: Row, type: string, to: TaskState, who: Writer, now: number, set: Partial<Row>, data?: unknown): Row {
+  #moveAndClearClaim(
+    row: Row,
+    type: string,
+    to: TaskState,
+    who: Writer,
+    now: number,
+    set: Partial<Row>,
+    data?: unknown,
+  ): Row {
     return this.#move(row, type, to, who, now, { holder: null, lease_expires_at: null, ...set }, data)
   }
 
@@ -496,8 +597,21 @@ export class Store {
     const readyAt = to !== 'ready' ? null : row.state === 'ready' ? row.ready_at : now
     const next: Row = { ...row, ...set, state: to, ready_at: readyAt, updated_at: now }
     this.#db
-      .prepare('UPDATE tasks SET state = ?, holder = ?, epoch = ?, attempts = ?, lease_expires_at = ?, ready_at = ?, result = ?, reason = ?, updated_at = ? WHERE id = ?')
-      .run(next.state, next.holder, next.epoch, next.attempts, next.lease_expires_at, next.ready_at, next.result, next.reason, now, row.id)
+      .prepare(
+        'UPDATE tasks SET state = ?, holder = ?, epoch = ?, attempts = ?, lease_expires_at = ?, ready_at = ?, result = ?, reason = ?, updated_at = ? WHERE id = ?',
+      )
+      .run(
+        next.state,
+        next.holder,
+        next.epoch,
+        next.attempts,
+        next.lease_expires_at,
+        next.ready_at,
+        next.result,
+        next.reason,
+        now,
+        row.id,
+      )
     const eventData = data ?? {
       epoch: next.epoch,
       leaseExpiresAt: next.lease_expires_at,
@@ -508,11 +622,31 @@ export class Store {
     return next
   }
 
-  #event(taskId: number, type: string, who: Writer, from: TaskState | null, to: TaskState, data: unknown, now: number): TaskEvent {
+  #event(
+    taskId: number,
+    type: string,
+    who: Writer,
+    from: TaskState | null,
+    to: TaskState,
+    data: unknown,
+    now: number,
+  ): TaskEvent {
     const { lastInsertRowid } = this.#db
-      .prepare('INSERT INTO events (task_id, type, actor, request_id, from_state, to_state, data, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .prepare(
+        'INSERT INTO events (task_id, type, actor, request_id, from_state, to_state, data, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      )
       .run(taskId, type, who.actor, who.requestId ?? null, from, to, JSON.stringify(data ?? null), now)
-    return { seq: Number(lastInsertRowid), taskId, type, actor: who.actor, requestId: who.requestId ?? null, from, to, data: data ?? null, at: now }
+    return {
+      seq: Number(lastInsertRowid),
+      taskId,
+      type,
+      actor: who.actor,
+      requestId: who.requestId ?? null,
+      from,
+      to,
+      data: data ?? null,
+      at: now,
+    }
   }
 
   #rows(state: TaskState | undefined, queue: string | undefined, order = 'id'): Row[] {
@@ -526,7 +660,10 @@ export class Store {
       where.push(queue.endsWith('/') ? 'substr(queue, 1, length(?)) = ?' : 'queue = ?')
       params.push(...(queue.endsWith('/') ? [queue, queue] : [queue]))
     }
-    return this.#all(`SELECT * FROM tasks ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order}`, ...params)
+    return this.#all(
+      `SELECT * FROM tasks ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order}`,
+      ...params,
+    )
   }
 
   #row(id: number): Row {
@@ -619,7 +756,10 @@ function sortedLabels(labels: Labels | undefined): Labels | null {
 
 function checkLease(leaseMs: number | undefined): number {
   const lease = leaseMs ?? DEFAULT_LEASE_MS
-  need(Number.isInteger(lease) && lease >= MIN_LEASE_MS && lease <= MAX_LEASE_MS, `leaseMs must be an integer from ${MIN_LEASE_MS} to ${MAX_LEASE_MS}`)
+  need(
+    Number.isInteger(lease) && lease >= MIN_LEASE_MS && lease <= MAX_LEASE_MS,
+    `leaseMs must be an integer from ${MIN_LEASE_MS} to ${MAX_LEASE_MS}`,
+  )
   return lease
 }
 
@@ -632,7 +772,12 @@ function isName(value: unknown): value is string {
 }
 
 function isLabels(value: unknown): value is Labels {
-  return typeof value === 'object' && value !== null && !Array.isArray(value) && Object.values(value).every((v) => typeof v === 'string')
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.values(value).every((v) => typeof v === 'string')
+  )
 }
 
 function need(ok: boolean, message: string): asserts ok {

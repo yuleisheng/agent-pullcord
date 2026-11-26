@@ -40,7 +40,10 @@ function editConfig<T>(path: string, edit: () => T): T {
     fd = openSync(lock, 'wx', 0o600)
   } catch (error) {
     if (error instanceof Error && 'code' in error && error.code === 'EEXIST') {
-      throw new CliError('store_locked', `Configuration ${path} is locked. If a setup command crashed, stop all setup commands using this file before removing ${lock} and retrying.`)
+      throw new CliError(
+        'store_locked',
+        `Configuration ${path} is locked. If a setup command crashed, stop all setup commands using this file before removing ${lock} and retrying.`,
+      )
     }
     throw error
   }
@@ -72,7 +75,8 @@ function issueKey() {
 export async function init({ db = DEFAULT_DB, keys = DEFAULT_KEYS }: { db?: string; keys?: string }) {
   const { initializeDatabase } = await import('../serve.ts')
   return editConfig(keys, () => {
-    if (lstatSync(keys, { throwIfNoEntry: false })) invalid('A key file already exists. Use pullcord keys to manage it.')
+    if (lstatSync(keys, { throwIfNoEntry: false }))
+      invalid('A key file already exists. Use pullcord keys to manage it.')
     const { key, sha256 } = issueKey()
     initializeDatabase(db)
     writeConfig(keys, [{ agent: 'admin', queues: ['*'], can: ACTIONS, sha256 }], false)
@@ -84,14 +88,20 @@ function csv(value: string): string[] {
   return value.split(',').map((part) => part.trim())
 }
 
-export function createKey(agent: string, { keys = DEFAULT_KEYS, queues, can }: { keys?: string; queues?: string; can?: string }) {
+export function createKey(
+  agent: string,
+  { keys = DEFAULT_KEYS, queues, can }: { keys?: string; queues?: string; can?: string },
+) {
   if (queues === undefined) invalid('Pass --queues <scope[,scope...]>.')
   const url = new URL('mcp', hubUrl()).href
   return editConfig(keys, () => {
     const { key, sha256 } = issueKey()
     const scopes = csv(queues)
     const actions = can === undefined ? AGENT_ACTIONS : csv(can)
-    const entries = validate(parseKeyConfig, [...readConfig(keys, parseKeyConfig), { agent, queues: scopes, can: actions, sha256 }])
+    const entries = validate(parseKeyConfig, [
+      ...readConfig(keys, parseKeyConfig),
+      { agent, queues: scopes, can: actions, sha256 },
+    ])
     writeConfig(keys, entries)
     const mcp = { mcpServers: { pullcord: { url, headers: { Authorization: `Bearer ${key}` } } } }
     return { agent, queues: scopes, can: actions, key, mcp, restart_required: true }
@@ -112,9 +122,17 @@ export function revokeKey(agent: string, keys = DEFAULT_KEYS) {
   })
 }
 
-export function addSource(provider: string, options: {
-  sources?: string; name?: string; queue?: string; retry?: string; 'public-url'?: string; 'secret-file'?: string
-}) {
+export function addSource(
+  provider: string,
+  options: {
+    sources?: string
+    name?: string
+    queue?: string
+    retry?: string
+    'public-url'?: string
+    'secret-file'?: string
+  },
+) {
   const { sources = DEFAULT_SOURCES, name = provider, queue, retry = 'manual', 'secret-file': secretFile } = options
   if (queue === undefined) invalid('Pass --queue <queue>.')
   const generated = secretFile === undefined && provider !== 'pagerduty'
@@ -130,7 +148,9 @@ export function addSource(provider: string, options: {
   const [source] = validate(parseSourceConfig, [{ name, provider, queue, retry, secret: secret ?? 'pending' }])
   const webhook_url = new URL(`ingest/${encodeURIComponent(source.name)}`, hubUrl(options['public-url'])).href
   if (secret === undefined) {
-    invalid(`PagerDuty issues the signing secret. Set up ${webhook_url} there, then pass its secret with --secret-file <path>.`)
+    invalid(
+      `PagerDuty issues the signing secret. Set up ${webhook_url} there, then pass its secret with --secret-file <path>.`,
+    )
   }
   return editConfig(sources, () => {
     const entries = validate(parseSourceConfig, [...readConfig(sources, parseSourceConfig, []), source])

@@ -13,7 +13,10 @@ const STOP_POLL_MS = 25
 function watchExit(child: ChildProcess): Promise<Exit> {
   return new Promise((resolve) => {
     child.once('error', (error: NodeJS.ErrnoException) => {
-      resolve({ code: error.code === 'ENOENT' ? 127 : 1, reason: `Could not start the command${error.code ? ` (${error.code})` : ''}.` })
+      resolve({
+        code: error.code === 'ENOENT' ? 127 : 1,
+        reason: `Could not start the command${error.code ? ` (${error.code})` : ''}.`,
+      })
     })
     child.once('close', (code, signal) => {
       if (signal) resolve({ code: 128 + constants.signals[signal], reason: `Command was terminated by ${signal}.` })
@@ -46,8 +49,8 @@ async function waitForCommandToStop(child: ChildProcess): Promise<boolean> {
 }
 
 async function stopCommand(child: ChildProcess, signal: NodeJS.Signals): Promise<void> {
-  if (!signalCommand(child, signal) || await waitForCommandToStop(child)) return
-  if (!signalCommand(child, 'SIGKILL') || await waitForCommandToStop(child)) return
+  if (!signalCommand(child, signal) || (await waitForCommandToStop(child))) return
+  if (!signalCommand(child, 'SIGKILL') || (await waitForCommandToStop(child))) return
   throw new CliError('command_not_stopped', 'Could not confirm the command stopped. The claim will expire.')
 }
 
@@ -61,7 +64,10 @@ export async function run(client: Client, selector: ClaimSelector, command: stri
 
   function stopChild(signal: NodeJS.Signals) {
     renewals.abort()
-    if (child && !shutdown) shutdown = stopCommand(child, signal).catch((error: unknown) => { shutdownError = error })
+    if (child && !shutdown)
+      shutdown = stopCommand(child, signal).catch((error: unknown) => {
+        shutdownError = error
+      })
   }
 
   function interrupt(signal: NodeJS.Signals) {
@@ -77,7 +83,9 @@ export async function run(client: Client, selector: ClaimSelector, command: stri
     if (!interrupted) {
       try {
         child = spawn(command[0], command.slice(1), {
-          detached: useProcessGroup, env: { ...process.env, PULLCORD_TASK: JSON.stringify(task) }, stdio: [0, json ? 2 : 1, 2],
+          detached: useProcessGroup,
+          env: { ...process.env, PULLCORD_TASK: JSON.stringify(task) },
+          stdio: [0, json ? 2 : 1, 2],
         })
       } catch {
         exit = { code: 1, reason: 'Could not start the command.' }
@@ -85,7 +93,10 @@ export async function run(client: Client, selector: ClaimSelector, command: stri
       if (child) {
         let renewalFailure: unknown
         const renewing = (async () => {
-          while (await delay(interval, true, { signal: renewals.signal }).catch(() => false) && !renewals.signal.aborted) {
+          while (
+            (await delay(interval, true, { signal: renewals.signal }).catch(() => false)) &&
+            !renewals.signal.aborted
+          ) {
             await client.holder('renew', task, { lease: DEFAULT_LEASE_MS / 1_000 }, AbortSignal.timeout(interval))
           }
         })().catch((error: unknown) => {

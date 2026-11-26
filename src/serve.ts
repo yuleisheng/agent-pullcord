@@ -25,7 +25,9 @@ export function createHttpServer(store: Store, keys: unknown, sources: unknown =
       res.once('close', () => abort.abort())
       const init: RequestInit & { duplex?: 'half' } = {
         method: req.method,
-        headers: Object.fromEntries(Object.entries(req.headersDistinct).map(([name, values]) => [name, values?.join(', ') ?? ''])),
+        headers: Object.fromEntries(
+          Object.entries(req.headersDistinct).map(([name, values]) => [name, values?.join(', ') ?? '']),
+        ),
         signal: abort.signal,
       }
       if (req.method === 'POST') {
@@ -49,7 +51,7 @@ function readConfig(path: string, kind: 'key' | 'source', optional = false): unk
     raw = readFileSync(path, 'utf8')
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT' && optional) return []
-    throw new Error(`The ${kind} file could not be read. Check its path and permissions.`)
+    throw new Error(`The ${kind} file could not be read. Check its path and permissions.`, { cause: error })
   }
   try {
     return JSON.parse(raw)

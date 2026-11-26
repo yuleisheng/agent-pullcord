@@ -28,7 +28,14 @@ const CONFIG_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
 
 export function parsePublicUrl(value: string): URL {
   const url = URL.parse(value)
-  if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password || url.search || url.hash) {
+  if (
+    !url ||
+    (url.protocol !== 'http:' && url.protocol !== 'https:') ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
     throw new Error('Use an absolute HTTP(S) URL without credentials, a query, or a fragment.')
   }
   return url
@@ -39,10 +46,13 @@ export function parseKeyConfig(config: unknown): KeyConfig[] {
   const agents = new Set<string>()
   const digests = new Set<string>()
   return (config as unknown[]).map((entry) => {
-    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) throw new Error('Each key entry must be a JSON object.')
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry))
+      throw new Error('Each key entry must be a JSON object.')
     const { agent, sha256, queues, can } = entry as Record<string, unknown>
     if (typeof agent !== 'string' || !CONFIG_NAME.test(agent) || agents.has(agent)) {
-      throw new Error('Each key needs a unique agent name (1–64 letters, digits, dots, underscores, or hyphens, starting with a letter or digit).')
+      throw new Error(
+        'Each key needs a unique agent name (1–64 letters, digits, dots, underscores, or hyphens, starting with a letter or digit).',
+      )
     }
     if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(sha256) || digests.has(sha256)) {
       throw new Error('Each key needs a unique lowercase hex SHA-256 digest, not the bearer key.')
@@ -63,18 +73,22 @@ export function parseSourceConfig(config: unknown): SourceConfig[] {
   if (!Array.isArray(config)) throw new Error('The source file must contain a JSON array.')
   const names = new Set<string>()
   return (config as unknown[]).map((entry) => {
-    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) throw new Error('Each source entry must be a JSON object.')
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry))
+      throw new Error('Each source entry must be a JSON object.')
     const { name, provider: kind, queue, secret, retry } = entry as Record<string, unknown>
     const provider = SOURCE_KINDS.find((candidate) => candidate === kind)
     if (typeof name !== 'string' || !CONFIG_NAME.test(name) || names.has(name)) {
-      throw new Error('Each source needs a unique name (1–64 letters, digits, dots, underscores, or hyphens, starting with a letter or digit).')
+      throw new Error(
+        'Each source needs a unique name (1–64 letters, digits, dots, underscores, or hyphens, starting with a letter or digit).',
+      )
     }
     if (!provider) throw new Error(`Choose one of these source providers: ${SOURCE_KINDS.join(', ')}.`)
     if (typeof queue !== 'string' || !queue.trim() || queue === '*' || queue.endsWith('/')) {
       throw new Error('Each source needs an exact queue name, not a wildcard or prefix.')
     }
     if (typeof secret !== 'string' || !secret.trim()) throw new Error('Each source needs a non-empty signing secret.')
-    if (retry !== undefined && retry !== 'manual' && retry !== 'safe') throw new Error('Choose manual or safe for the source retry policy.')
+    if (retry !== undefined && retry !== 'manual' && retry !== 'safe')
+      throw new Error('Choose manual or safe for the source retry policy.')
     names.add(name)
     return { name, provider, queue, secret, retry }
   })

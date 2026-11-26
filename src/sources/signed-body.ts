@@ -2,7 +2,13 @@ import type { IngestInput } from '../store.ts'
 
 export type SourceEvent =
   | { action: 'ignore' }
-  | { action: 'create'; task: Pick<IngestInput, 'dedupeKey' | 'kind' | 'title' | 'sourceUrl'> & { payload: Record<string, unknown>; adapter: string } }
+  | {
+      action: 'create'
+      task: Pick<IngestInput, 'dedupeKey' | 'kind' | 'title' | 'sourceUrl'> & {
+        payload: Record<string, unknown>
+        adapter: string
+      }
+    }
   | { action: 'cancel'; dedupeKey: string; reason: string; requestId: string }
 
 export class SourceError extends Error {
@@ -28,14 +34,19 @@ export async function verifySignature(
   prefix: string,
   bytes: Uint8Array<ArrayBuffer>,
 ): Promise<void> {
-  const digests = signatures.map((value) => value.trim())
+  const digests = signatures
+    .map((value) => value.trim())
     .filter((value) => value.startsWith(prefix))
     .map((value) => value.slice(prefix.length))
     .filter((hex) => /^[a-f\d]{64}$/i.test(hex))
   if (digests.length) {
-    const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'])
+    const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, [
+      'verify',
+    ])
     for (const hex of digests) {
-      const signature = Uint8Array.from({ length: 32 }, (_, index) => Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16))
+      const signature = Uint8Array.from({ length: 32 }, (_, index) =>
+        Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16),
+      )
       if (await crypto.subtle.verify('HMAC', key, signature, bytes)) return
     }
   }

@@ -4,14 +4,25 @@
   "description": "A headless, self-hosted task hub that turns events from services into tasks agents claim under a fenced lease.",
   "license": "Apache-2.0",
   "type": "module",
-  "repository": { "type": "git", "url": "git+https://github.com/yuleisheng/agent-pullcord.git" },
-  "bin": { "pullcord": "dist/cli/index.js" },
-  "files": ["dist"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yuleisheng/agent-pullcord.git"
+  },
+  "bin": {
+    "pullcord": "dist/cli/index.js"
+  },
+  "files": [
+    "dist"
+  ],
   "engines": {
     "node": ">=22.18"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "check": "npm run lint && npm run format:check && npm run typecheck && npm test && npm run test:acceptance",
+    "format": "prettier --write src test .github/workflows eslint.config.js package.json \"tsconfig*.json\" .prettierrc.json",
+    "format:check": "prettier --check src test .github/workflows eslint.config.js package.json \"tsconfig*.json\" .prettierrc.json",
+    "lint": "eslint src test --max-warnings 0",
     "prepack": "npm run build",
     "serve": "node src/serve.ts",
     "test": "node --test --disable-warning=ExperimentalWarning \"test/**/*.test.ts\"",
@@ -19,8 +30,13 @@
     "typecheck": "tsc"
   },
   "devDependencies": {
+    "@babel/core": "8.1.3",
+    "@babel/eslint-parser": "8.1.2",
+    "@eslint/js": "10.0.1",
     "@types/node": "^22.20.5",
+    "eslint": "10.15.0",
     "fast-check": "^4.11.0",
+    "prettier": "3.10.1",
     "typescript": "^7.0.2"
   }
 }
