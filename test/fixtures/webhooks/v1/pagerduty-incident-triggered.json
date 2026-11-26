@@ -1,0 +1,26 @@
+{
+  "event": {
+    "id": "01JB62CX409Z1WKPNQ1G3EEH34",
+    "event_type": "incident.triggered",
+    "resource_type": "incident",
+    "occurred_at": "2024-10-27T03:33:20.000Z",
+    "agent": null,
+    "client": null,
+    "data": {
+      "id": "PGR0VU2",
+      "type": "incident",
+      "number": 42,
+      "title": "Checkout latency — p95 exceeded",
+      "status": "triggered",
+      "urgency": "high",
+      "created_at": "2024-10-27T03:33:20Z",
+      "html_url": "https://oncall.example.test/incidents/PGR0VU2",
+      "service": {
+        "id": "PCHECK1",
+        "type": "service_reference",
+        "summary": "Checkout API",
+        "html_url": "https://oncall.example.test/services/PCHECK1"
+      }
+    }
+  }
+}

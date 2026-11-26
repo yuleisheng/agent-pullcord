@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash, createHmac } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -31,6 +31,8 @@ const providers = [
 
 interface WireTask {
   id: number
+  source: string
+  queue: string
   dedupe_key: string
   state: TaskState
   holder: string | null
@@ -161,8 +163,15 @@ async function listen(ws: ReturnType<typeof temporaryHub>, options: string[] = [
       body: JSON.stringify(body),
       headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
     })
-  const signed = (name: string, header: string, prefix: string, secret: string, fixture: object, headers = {}) => {
-    const body = JSON.stringify(fixture, null, 2)
+  const signed = (
+    name: string,
+    header: string,
+    prefix: string,
+    secret: string,
+    fixture: object | string,
+    headers: Record<string, string> = {},
+  ) => {
+    const body = typeof fixture === 'string' ? fixture : JSON.stringify(fixture, null, 2)
     const digest = createHmac('sha256', secret).update(body).digest('hex')
     return request(`/ingest/${name}`, {
       method: 'POST',
@@ -199,6 +208,38 @@ async function ok<T>(response: Response, status = 200): Promise<T> {
 
 async function rejected(response: Response, status: number, code: string): Promise<void> {
   assert.equal((await ok<{ code: string }>(response, status)).code, code)
+}
+
+type Hub = Awaited<ReturnType<typeof listen>>
+
+async function connectMcp(hub: Hub, auth: { Authorization: string }, origin = hub.url) {
+  const headers = {
+    ...auth,
+    Origin: origin,
+    'Content-Type': 'application/json',
+    Accept: 'application/json, text/event-stream',
+  }
+  const rpc = (message: object) =>
+    hub.request('/mcp', { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', ...message }) })
+  const init = await rpc({
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'fixture', version: '1' } },
+  })
+  const session = init.headers.get('MCP-Session-Id')
+  assert.ok(session)
+  const { result } = await ok<{ result: { protocolVersion: string } }>(init)
+  Object.assign(headers, { 'MCP-Session-Id': session, 'MCP-Protocol-Version': result.protocolVersion })
+  assert.equal((await rpc({ method: 'notifications/initialized' })).status, 202)
+
+  let id = 1
+  return async (name: string, args: object) => {
+    const response = await rpc({ id: ++id, method: 'tools/call', params: { name, arguments: args } })
+    const { result } = await ok<{
+      result: { isError: false; structuredContent: WireTask } | { isError: true; structuredContent: { code: string } }
+    }>(response)
+    return result
+  }
 }
 
 test(
@@ -342,10 +383,130 @@ test('the packaged watcher resumes from its durable cursor after SIGKILL', { tim
   assert.deepEqual(await restarted.events(catchup.cursor), { events: [], cursor: 4 })
 })
 
+test(
+  'the packaged hub dedupes PagerDuty and GitHub, fences competing agents, and resumes a watcher',
+  { timeout: 20_000 },
+  async (t) => {
+    const pagerduty = providers[0]
+    const github = {
+      name: 'github',
+      provider: 'github',
+      queue: 'incidents/github',
+      secret: 'fixture github secret',
+      retry: 'safe',
+    }
+    const ws = workspace('multi-source', [pagerduty, github])
+    const fixtures = new URL('fixtures/webhooks/v1/', import.meta.url)
+    const incidentBody = readFileSync(new URL('pagerduty-incident-triggered.json', fixtures), 'utf8')
+    const issueBody = readFileSync(new URL('github-issues-opened.json', fixtures), 'utf8')
+    const deliverIncident = (hub: Hub) =>
+      hub.signed(pagerduty.name, 'X-PagerDuty-Signature', 'v1=', pagerduty.secret, incidentBody, {
+        'User-Agent': 'PagerDuty-Webhook/V3.0',
+        'X-Webhook-Id': '01JB62CX409Z1WKPNQ1G3EEH35',
+        'X-Webhook-Subscription': 'PWEBHK1',
+      })
+    const deliverIssue = (hub: Hub, secret = github.secret, delivery = 'b3a542bf-b9f7-454d-85bc-ff84284d6c04') =>
+      hub.signed(github.name, 'X-Hub-Signature-256', 'sha256=', secret, issueBody, {
+        'User-Agent': 'GitHub-Hookshot/5d7a9a6',
+        'X-GitHub-Event': 'issues',
+        'X-GitHub-Delivery': delivery,
+        'X-GitHub-Hook-ID': '348732615',
+      })
+    const accept = async (delivery: Promise<Response>) => ok(await delivery, 202)
+    const audit = (events: WireEvent[]) =>
+      events.map((e) => [e.seq, e.task_id, e.type, e.actor, e.request_id, e.from, e.to])
+
+    const first = await listen(ws)
+    t.after(() => first.stop())
+    await rejected(await deliverIssue(first, 'wrong fixture secret'), 401, 'unauthorized')
+    const empty = await first.snapshot()
+    assert.deepEqual(empty, { tasks: [], cursor: 0 })
+    for (const deliver of [deliverIncident, deliverIssue]) {
+      await Promise.all([accept(deliver(first)), accept(deliver(first))])
+    }
+    const { tasks } = await first.snapshot()
+    assert.equal(tasks.length, 2)
+    const incident = tasks.find(({ source }) => source === 'pagerduty')
+    const issue = tasks.find(({ source }) => source === 'github')
+    assert.ok(incident && issue)
+    assert.deepEqual(
+      [incident, issue].map(({ queue, dedupe_key, state, retry }) => [queue, dedupe_key, state, retry]),
+      [
+        ['incidents/pagerduty', 'PGR0VU2', 'ready', 'manual'],
+        ['incidents/github', 'issue:91073', 'ready', 'safe'],
+      ],
+    )
+
+    const mcp = await connectMcp(first, { Authorization: `Bearer ${keys[1]}` })
+    const claim = { queue: github.queue, request_id: 'race-issue', lease: 10 }
+    const [httpRace, mcpRace] = await Promise.all([first.post('/tasks/claim', claim, keys[0]), mcp('claim', claim)])
+    if (mcpRace.isError) assert.equal(mcpRace.structuredContent.code, 'nothing_ready')
+    else await rejected(httpRace, 409, 'nothing_ready')
+    const held = mcpRace.isError ? await ok<WireTask>(httpRace) : mcpRace.structuredContent
+    const winner = mcpRace.isError ? 0 : 1
+    const other = 1 - winner
+    const winnerActor = `agent:worker-${winner}`
+    const otherActor = `agent:worker-${other}`
+    const deadline = initialTime + 10_000
+    assert.deepEqual([held.id, held.holder, held.epoch, held.lease_expires_at], [issue.id, winnerActor, 1, deadline])
+    const checkpoint = await first.events(empty.cursor)
+    assert.deepEqual(audit(checkpoint.events), [
+      [1, incident.id, 'task.created', 'source:pagerduty', null, null, 'ready'],
+      [2, issue.id, 'task.created', 'source:github', null, null, 'ready'],
+      [3, issue.id, 'task.claimed', winnerActor, 'race-issue', 'ready', 'claimed'],
+    ])
+    assert.equal(checkpoint.cursor, 3)
+    const cursorFile = join(ws.cwd, 'watcher-cursor')
+    writeFileSync(cursorFile, String(checkpoint.cursor))
+
+    const complete = (task: WireTask, request_id: string, worker: number) =>
+      first.post(`/tasks/${task.id}/complete`, { epoch: task.epoch, request_id }, keys[worker])
+    ws.setClock(deadline)
+    await rejected(await complete(held, 'expired-complete', winner), 409, 'claim_lost')
+    const reclaimAt = deadline + 1
+    ws.setClock(reclaimAt)
+    const reclaimed = await ok<WireTask>(
+      await first.post('/tasks/claim', { id: issue.id, request_id: 'reclaim-issue' }, keys[other]),
+    )
+    assert.deepEqual([reclaimed.id, reclaimed.holder, reclaimed.epoch], [issue.id, otherActor, 2])
+    await ok(await complete(reclaimed, 'complete-issue', other))
+    const incidentClaim = await ok<WireTask>(
+      await first.post('/tasks/claim', { id: incident.id, request_id: 'claim-incident' }, keys[winner]),
+    )
+    await ok(await complete(incidentClaim, 'complete-incident', winner))
+
+    assert.equal(await first.stop('SIGKILL'), 'SIGKILL')
+    const restarted = await listen(ws)
+    t.after(() => restarted.stop())
+    await Promise.all([
+      accept(deliverIncident(restarted)),
+      accept(deliverIssue(restarted)),
+      accept(deliverIssue(restarted, github.secret, 'd2d75427-f330-4eba-9506-b44810265799')),
+    ])
+    const catchup = await restarted.events(Number(readFileSync(cursorFile, 'utf8')))
+    assert.deepEqual(audit(catchup.events), [
+      [4, issue.id, 'task.lease_expired', 'pullcord', null, 'claimed', 'ready'],
+      [5, issue.id, 'task.claimed', otherActor, 'reclaim-issue', 'ready', 'claimed'],
+      [6, issue.id, 'task.completed', otherActor, 'complete-issue', 'claimed', 'completed'],
+      [7, incident.id, 'task.claimed', winnerActor, 'claim-incident', 'ready', 'claimed'],
+      [8, incident.id, 'task.completed', winnerActor, 'complete-incident', 'claimed', 'completed'],
+    ])
+    assert.equal(catchup.events[0].at, reclaimAt, 'the rejected completion must not record lease expiry')
+    assert.equal(catchup.cursor, 8)
+    assert.deepEqual(await restarted.events(catchup.cursor), { events: [], cursor: 8 })
+    const final = await restarted.snapshot()
+    assert.equal(final.cursor, catchup.cursor)
+    assert.deepEqual(final.tasks.map(({ id, dedupe_key, state }) => [dedupe_key, id, state]).sort(), [
+      ['PGR0VU2', incident.id, 'completed'],
+      ['issue:91073', issue.id, 'completed'],
+    ])
+  },
+)
+
 const modelQueue = 'incidents/model'
 const modelSources = [providers[1], providers[2]].map((source) => ({ ...source, queue: modelQueue }))
 
-async function send(hub: Awaited<ReturnType<typeof listen>>, call: Call): Promise<Outcome> {
+async function send(hub: Hub, call: Call): Promise<Outcome> {
   const { t, id, epoch, retry, text, value } = call
   const lease = call.lease / 1000
   const body = {
@@ -520,33 +681,14 @@ test(
       ),
       202,
     )
-    const headers = {
-      ...mcp.headers,
-      Origin: origin,
-      'Content-Type': 'application/json',
-      Accept: 'application/json, text/event-stream',
-    }
-    const rpc = (message: object) =>
-      hub.request('/mcp', { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', ...message }) })
-    const init = await rpc({
-      id: 1,
-      method: 'initialize',
-      params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'fixture', version: '1' } },
-    })
-    const session = init.headers.get('MCP-Session-Id')
-    assert.ok(session)
-    const { result } = await ok<{ result: { protocolVersion: string } }>(init)
-    Object.assign(headers, { 'MCP-Session-Id': session, 'MCP-Protocol-Version': result.protocolVersion })
-    assert.equal((await rpc({ method: 'notifications/initialized' })).status, 202)
-    const call = async (id: number, name: string, args: object) => {
-      const response = await rpc({ id, method: 'tools/call', params: { name, arguments: args } })
-      const { result } = await ok<{ result: { isError: boolean; structuredContent: WireTask } }>(response)
-      assert.equal(result.isError, false, JSON.stringify(result.structuredContent))
-      return result.structuredContent
-    }
-    const issue = await call(2, 'claim', { queue: 'demo/github' })
+    const call = await connectMcp(hub, mcp.headers, origin)
+    const claim = await call('claim', { queue: 'demo/github' })
+    assert.equal(claim.isError, false, JSON.stringify(claim.structuredContent))
+    const issue = claim.structuredContent
     assert.deepEqual([issue.state, issue.dedupe_key], ['claimed', 'issue:109'])
-    assert.equal((await call(3, 'complete', { id: issue.id, epoch: issue.epoch })).state, 'completed')
+    const completed = await call('complete', { id: issue.id, epoch: issue.epoch })
+    assert.equal(completed.isError, false, JSON.stringify(completed.structuredContent))
+    assert.equal(completed.structuredContent.state, 'completed')
     assert.deepEqual(
       (await ok<{ tasks: WireTask[] }>(await hub.get('/tasks', admin_key))).tasks.map(({ state }) => state),
       ['completed', 'completed'],
