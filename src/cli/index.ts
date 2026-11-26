@@ -65,18 +65,22 @@ function seconds(value: string | undefined, name: string): number | undefined {
 
 function labels(entries: string[] | undefined): Record<string, string> | undefined {
   if (!entries?.length) return undefined
-  const labels = Object.fromEntries(entries.map((label) => {
-    const split = label.indexOf('=')
-    if (split < 1) invalid('Write each --label as key=value.')
-    return [label.slice(0, split), label.slice(split + 1)]
-  }))
+  const labels = Object.fromEntries(
+    entries.map((label) => {
+      const split = label.indexOf('=')
+      if (split < 1) invalid('Write each --label as key=value.')
+      return [label.slice(0, split), label.slice(split + 1)]
+    }),
+  )
   if (Object.keys(labels).length !== entries.length) invalid('Specify each --label key once.')
   return labels
 }
 
 function output(value: unknown, json: boolean): Promise<void> {
   return new Promise((resolve, reject) => {
-    process.stdout.write(`${JSON.stringify(value, undefined, json ? undefined : 2)}\n`, (error) => error ? reject(error) : resolve())
+    process.stdout.write(`${JSON.stringify(value, undefined, json ? undefined : 2)}\n`, (error) =>
+      error ? reject(error) : resolve(),
+    )
   })
 }
 
@@ -131,10 +135,21 @@ async function dispatch(command: string, args: string[], json: boolean): Promise
       return
     }
     case 'sources': {
-      const { positionals: [action, provider], values } = options(args, {
-        sources: { type: 'string' }, name: { type: 'string' }, queue: { type: 'string' }, retry: { type: 'string' },
-        'public-url': { type: 'string' }, 'secret-file': { type: 'string' },
-      }, 2)
+      const {
+        positionals: [action, provider],
+        values,
+      } = options(
+        args,
+        {
+          sources: { type: 'string' },
+          name: { type: 'string' },
+          queue: { type: 'string' },
+          retry: { type: 'string' },
+          'public-url': { type: 'string' },
+          'secret-file': { type: 'string' },
+        },
+        2,
+      )
       if (action !== 'add') invalid('Use pullcord sources add <pagerduty|github|generic>.')
       return (await import('./setup.ts')).addSource(provider, values)
     }
@@ -142,12 +157,18 @@ async function dispatch(command: string, args: string[], json: boolean): Promise
       const [action, ...rest] = args
       const setup = await import('./setup.ts')
       if (action === 'create') {
-        const { positionals: [agent], values } = options(rest, { ...keyFile, queues: { type: 'string' }, can: { type: 'string' } }, 1)
+        const {
+          positionals: [agent],
+          values,
+        } = options(rest, { ...keyFile, queues: { type: 'string' }, can: { type: 'string' } }, 1)
         return setup.createKey(agent, values)
       }
       if (action === 'list') return setup.listKeys(options(rest, keyFile, 0).values.keys)
       if (action === 'revoke') {
-        const { positionals: [agent], values } = options(rest, keyFile, 1)
+        const {
+          positionals: [agent],
+          values,
+        } = options(rest, keyFile, 1)
         return setup.revokeKey(agent, values.keys)
       }
       invalid('Use pullcord keys create, list, or revoke.')
@@ -164,19 +185,37 @@ async function dispatch(command: string, args: string[], json: boolean): Promise
       return client.request(`tasks?${query}`)
     }
     case 'show': {
-      const { positionals: [id] } = options(args, {}, 1)
+      const {
+        positionals: [id],
+      } = options(args, {}, 1)
       return client.request(`tasks/${integer(id, 1, 'task ID')}`)
     }
     case 'claim': {
-      const { positionals: [queue], values } = options(args, {
-        label: { type: 'string', multiple: true }, wait: { type: 'string' }, lease: { type: 'string' },
-      }, 1)
-      return client.claim({ queue, labels: labels(values.label) }, {
-        wait: seconds(values.wait, '--wait'), lease: seconds(values.lease, '--lease'),
-      })
+      const {
+        positionals: [queue],
+        values,
+      } = options(
+        args,
+        {
+          label: { type: 'string', multiple: true },
+          wait: { type: 'string' },
+          lease: { type: 'string' },
+        },
+        1,
+      )
+      return client.claim(
+        { queue, labels: labels(values.label) },
+        {
+          wait: seconds(values.wait, '--wait'),
+          lease: seconds(values.lease, '--lease'),
+        },
+      )
     }
     case 'renew': {
-      const { positionals: [id], values } = options(args, { lease: { type: 'string' } }, 1)
+      const {
+        positionals: [id],
+        values,
+      } = options(args, { lease: { type: 'string' } }, 1)
       const lease = seconds(values.lease, '--lease')
       return client.holder(command, client.savedClaim(integer(id, 1, 'task ID')), { lease })
     }
@@ -185,20 +224,34 @@ async function dispatch(command: string, args: string[], json: boolean): Promise
     case 'release':
     case 'block': {
       const count = command === 'fail' || command === 'block' ? 2 : 1
-      const { positionals: [id, text], values } = options(args, {
-        ...(command === 'fail' && { retry: { type: 'boolean' } }),
-      }, count, command === 'complete' ? 2 : count)
+      const {
+        positionals: [id, text],
+        values,
+      } = options(
+        args,
+        {
+          ...(command === 'fail' && { retry: { type: 'boolean' } }),
+        },
+        count,
+        command === 'complete' ? 2 : count,
+      )
       const claim = client.savedClaim(integer(id, 1, 'task ID'))
-      const body = command === 'complete' ? { result: text }
-        : command === 'fail' ? { reason: text, retry: values.retry }
-        : command === 'block' ? { reason: text }
-        : {}
+      const body =
+        command === 'complete'
+          ? { result: text }
+          : command === 'fail'
+            ? { reason: text, retry: values.retry }
+            : command === 'block'
+              ? { reason: text }
+              : {}
       return client.holder(command, claim, body)
     }
     case 'run': {
       const separator = args.indexOf('--')
       if (separator < 0 || separator === args.length - 1) invalid('Use pullcord run <queue|id> -- <command> [args...].')
-      const { positionals: [target] } = options(args.slice(0, separator), {}, 1)
+      const {
+        positionals: [target],
+      } = options(args.slice(0, separator), {}, 1)
       const selector = /^\d+$/.test(target) ? { id: integer(target, 1, 'task ID') } : { queue: target }
       return run(client, selector, args.slice(separator + 1), json)
     }
@@ -206,12 +259,16 @@ async function dispatch(command: string, args: string[], json: boolean): Promise
     case 'unblock':
     case 'requeue':
     case 'cancel': {
-      const { positionals: [id, text] } = options(args, {}, command === 'log' || command === 'cancel' ? 2 : 1)
+      const {
+        positionals: [id, text],
+      } = options(args, {}, command === 'log' || command === 'cancel' ? 2 : 1)
       const body = command === 'log' ? { text } : command === 'cancel' ? { reason: text } : {}
       return client.write(`tasks/${integer(id, 1, 'task ID')}/${command}`, body)
     }
     case 'memo': {
-      const { positionals: [id, key, text] } = options(args, {}, 2, 3)
+      const {
+        positionals: [id, key, text],
+      } = options(args, {}, 2, 3)
       const task = `tasks/${integer(id, 1, 'task ID')}`
       if (text !== undefined) {
         let value: unknown
@@ -232,7 +289,12 @@ async function dispatch(command: string, args: string[], json: boolean): Promise
     }
     case 'events': {
       const { values } = options(args, { after: { type: 'string' }, follow: { type: 'boolean' } }, 0)
-      return events(client, values.after === undefined ? 0 : integer(values.after, 0, 'cursor'), values.follow === true, json)
+      return events(
+        client,
+        values.after === undefined ? 0 : integer(values.after, 0, 'cursor'),
+        values.follow === true,
+        json,
+      )
     }
     default:
       invalid('Unknown command. Run pullcord --help for usage.')

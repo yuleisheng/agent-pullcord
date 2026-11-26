@@ -9,7 +9,13 @@ const githubSecret = 'fake-github-webhook-secret'
 const genericSecret = 'fake-generic-webhook-secret'
 const encoder = new TextEncoder()
 
-async function readSourceEvent(provider: SourceKind, secret: string, headers: Headers, body: Uint8Array<ArrayBuffer>, clock: number) {
+async function readSourceEvent(
+  provider: SourceKind,
+  secret: string,
+  headers: Headers,
+  body: Uint8Array<ArrayBuffer>,
+  clock: number,
+) {
   const readEvent = await verifySourceDelivery(provider, secret, headers, body)
   return readEvent(clock)
 }
@@ -81,7 +87,10 @@ test('PagerDuty triggers and resolves the same incident across distinct delivery
   assert.deepEqual(retry, first)
   assert.equal(laterTrigger.action === 'create' && laterTrigger.task.dedupeKey, 'PGR0VU2')
   assert.deepEqual(cancel, {
-    action: 'cancel', dedupeKey: 'PGR0VU2', reason: 'PagerDuty resolved the incident.', requestId: '01HVP0RESOLVE9876',
+    action: 'cancel',
+    dedupeKey: 'PGR0VU2',
+    reason: 'PagerDuty resolved the incident.',
+    requestId: '01HVP0RESOLVE9876',
   })
 })
 
@@ -89,7 +98,10 @@ test('PagerDuty authenticates exact bytes and does not apply unverified resoluti
   const payload = pagerDutyEvent('incident.resolved')
   const { body, headers } = signedPagerDuty(payload)
   const unverified = sourceError(401, 'unauthorized')
-  await assert.rejects(readSourceEvent('pagerduty', pagerDutySecret, headers, encoder.encode(JSON.stringify(payload)), now), unverified)
+  await assert.rejects(
+    readSourceEvent('pagerduty', pagerDutySecret, headers, encoder.encode(JSON.stringify(payload)), now),
+    unverified,
+  )
   await assert.rejects(readSourceEvent('pagerduty', 'wrong-secret', headers, body, now), unverified)
   const wrongVersion = new Headers({ 'X-PagerDuty-Signature': `v2=${hmac(pagerDutySecret, body)}` })
   await assert.rejects(readSourceEvent('pagerduty', pagerDutySecret, wrongVersion, body, now), unverified)
@@ -97,7 +109,10 @@ test('PagerDuty authenticates exact bytes and does not apply unverified resoluti
   const malformedBytes = Uint8Array.of(0x7b, 0xff, 0x7d)
   const signed = new Headers({ 'X-PagerDuty-Signature': `v1=${hmac(pagerDutySecret, malformedBytes)}` })
   await assert.rejects(readSourceEvent('pagerduty', pagerDutySecret, new Headers(), malformedBytes, now), unverified)
-  await assert.rejects(readSourceEvent('pagerduty', pagerDutySecret, signed, malformedBytes, now), sourceError(400, 'invalid_argument'))
+  await assert.rejects(
+    readSourceEvent('pagerduty', pagerDutySecret, signed, malformedBytes, now),
+    sourceError(400, 'invalid_argument'),
+  )
 })
 
 test('PagerDuty bounds the signed occurrence time before creating or canceling a task', async () => {
@@ -108,31 +123,48 @@ test('PagerDuty bounds the signed occurrence time before creating or canceling a
 
   const ping = {
     event: {
-      id: '01CH754SM17TWPE2V2H4VPBRO7', event_type: 'pagey.ping', resource_type: 'pagey',
-      occurred_at: new Date(now).toISOString(), data: { message: 'Hello from Pagey!', type: 'ping' },
+      id: '01CH754SM17TWPE2V2H4VPBRO7',
+      event_type: 'pagey.ping',
+      resource_type: 'pagey',
+      occurred_at: new Date(now).toISOString(),
+      data: { message: 'Hello from Pagey!', type: 'ping' },
     },
   }
   assert.deepEqual(await pagerDuty(ping), { action: 'ignore' })
   assert.deepEqual(await pagerDuty(ping, now + 300_001), { action: 'ignore' })
 
   const payload = pagerDutyEvent('incident.resolved')
-  await assert.rejects(pagerDuty({ event: { ...payload.event, occurred_at: '2026-11-25T13:06:43.318' } }), sourceError(401, 'unauthorized'))
-  await assert.rejects(pagerDuty({ event: { ...payload.event, data: { id: ['PGR0VU2'] } } }), sourceError(400, 'invalid_argument'))
+  await assert.rejects(
+    pagerDuty({ event: { ...payload.event, occurred_at: '2026-11-25T13:06:43.318' } }),
+    sourceError(401, 'unauthorized'),
+  )
+  await assert.rejects(
+    pagerDuty({ event: { ...payload.event, data: { id: ['PGR0VU2'] } } }),
+    sourceError(400, 'invalid_argument'),
+  )
 })
 
 const githubIssue = {
   action: 'opened',
   issue: {
-    id: 91073, number: 42, title: 'Fix flaky integration test',
-    created_at: new Date(now).toISOString(), html_url: 'https://github.example.test/acme/app/issues/42',
+    id: 91073,
+    number: 42,
+    title: 'Fix flaky integration test',
+    created_at: new Date(now).toISOString(),
+    html_url: 'https://github.example.test/acme/app/issues/42',
   },
 }
 const githubRun = {
   action: 'completed',
   workflow_run: {
-    id: 91073, run_attempt: 1, name: 'CI', display_title: 'Build the release candidate',
-    status: 'completed', conclusion: 'failure',
-    created_at: new Date(now - 75 * 60_000).toISOString(), updated_at: new Date(now).toISOString(),
+    id: 91073,
+    run_attempt: 1,
+    name: 'CI',
+    display_title: 'Build the release candidate',
+    status: 'completed',
+    conclusion: 'failure',
+    created_at: new Date(now - 75 * 60_000).toISOString(),
+    updated_at: new Date(now).toISOString(),
     html_url: 'https://github.example.test/acme/app/actions/runs/91073',
   },
 }
@@ -152,19 +184,28 @@ test('GitHub namespaces issue and workflow IDs and keeps one task identity acros
   assert.deepEqual(await github('issues', githubIssue), {
     action: 'create',
     task: {
-      kind: 'issue', dedupeKey: 'issue:91073', title: 'Fix flaky integration test',
-      sourceUrl: 'https://github.example.test/acme/app/issues/42', payload: githubIssue, adapter: 'github:v1',
+      kind: 'issue',
+      dedupeKey: 'issue:91073',
+      title: 'Fix flaky integration test',
+      sourceUrl: 'https://github.example.test/acme/app/issues/42',
+      payload: githubIssue,
+      adapter: 'github:v1',
     },
   })
   assert.deepEqual(await github('workflow_run', githubRun), {
     action: 'create',
     task: {
-      kind: 'workflow_run', dedupeKey: 'workflow_run:91073', title: 'Build the release candidate',
-      sourceUrl: 'https://github.example.test/acme/app/actions/runs/91073', payload: githubRun, adapter: 'github:v1',
+      kind: 'workflow_run',
+      dedupeKey: 'workflow_run:91073',
+      title: 'Build the release candidate',
+      sourceUrl: 'https://github.example.test/acme/app/actions/runs/91073',
+      payload: githubRun,
+      adapter: 'github:v1',
     },
   })
   const retry = await github('workflow_run', {
-    ...githubRun, workflow_run: { ...githubRun.workflow_run, run_attempt: 2, display_title: null, html_url: 'javascript:alert(1)' },
+    ...githubRun,
+    workflow_run: { ...githubRun.workflow_run, run_attempt: 2, display_title: null, html_url: 'javascript:alert(1)' },
   })
   assert.equal(retry.action === 'create' && retry.task.dedupeKey, 'workflow_run:91073')
   assert.equal(retry.action === 'create' && retry.task.title, 'CI')
@@ -174,9 +215,13 @@ test('GitHub namespaces issue and workflow IDs and keeps one task identity acros
 test('GitHub ignores other actions and authenticates even an ignored event', async () => {
   assert.deepEqual(await github('issues', { ...githubIssue, action: 'closed' }), { action: 'ignore' })
   assert.deepEqual(await github('workflow_run', { ...githubRun, action: 'in_progress' }), { action: 'ignore' })
-  assert.deepEqual(await github('workflow_run', {
-    ...githubRun, workflow_run: { ...githubRun.workflow_run, conclusion: 'success' },
-  }), { action: 'ignore' })
+  assert.deepEqual(
+    await github('workflow_run', {
+      ...githubRun,
+      workflow_run: { ...githubRun.workflow_run, conclusion: 'success' },
+    }),
+    { action: 'ignore' },
+  )
   const ping = { zen: 'Keep it logically awesome.', hook_id: 19 }
   assert.deepEqual(await github('ping', ping), { action: 'ignore' })
   const { body, headers } = signedGitHub('ping', ping)
@@ -188,7 +233,11 @@ test('GitHub ignores other actions and authenticates even an ignored event', asy
 test('GitHub rejects stale events despite fresh unsigned headers or unrelated timestamps', async () => {
   const payload = {
     ...githubIssue,
-    issue: { ...githubIssue.issue, created_at: new Date(now - 300_001).toISOString(), updated_at: new Date(now).toISOString() },
+    issue: {
+      ...githubIssue.issue,
+      created_at: new Date(now - 300_001).toISOString(),
+      updated_at: new Date(now).toISOString(),
+    },
   }
   const { body, headers } = signedGitHub('issues', payload)
   headers.set('Date', new Date(now).toUTCString())
@@ -197,11 +246,17 @@ test('GitHub rejects stale events despite fresh unsigned headers or unrelated ti
   await assert.rejects(readSourceEvent('github', githubSecret, headers, body, now), unauthorized)
   const freshBody = signedGitHub('issues', githubIssue).body
   await assert.rejects(readSourceEvent('github', githubSecret, headers, freshBody, now), unauthorized)
-  await assert.rejects(github('workflow_run', {
-    ...githubRun, workflow_run: { ...githubRun.workflow_run, updated_at: new Date(now + 300_001).toISOString() },
-  }), unauthorized)
-  await assert.rejects(github('issues', { ...githubIssue, issue: { ...githubIssue.issue, id: 9_007_199_254_740_992 } }),
-    sourceError(400, 'invalid_argument'))
+  await assert.rejects(
+    github('workflow_run', {
+      ...githubRun,
+      workflow_run: { ...githubRun.workflow_run, updated_at: new Date(now + 300_001).toISOString() },
+    }),
+    unauthorized,
+  )
+  await assert.rejects(
+    github('issues', { ...githubIssue, issue: { ...githubIssue.issue, id: 9_007_199_254_740_992 } }),
+    sourceError(400, 'invalid_argument'),
+  )
 })
 
 function generic(payload: object) {
@@ -211,8 +266,16 @@ function generic(payload: object) {
 
 test('Generic HMAC uses the signed dedupe key without letting the body set hub fields', async () => {
   const payload = {
-    timestamp: now, dedupe_key: 'build#994', title: 'Failed deployment – π', data: { service: 'checkout' },
-    action: 'cancel', queue: 'admin', source: 'another', retry: 'safe', kind: 'arbitrary', state: 'completed',
+    timestamp: now,
+    dedupe_key: 'build#994',
+    title: 'Failed deployment – π',
+    data: { service: 'checkout' },
+    action: 'cancel',
+    queue: 'admin',
+    source: 'another',
+    retry: 'safe',
+    kind: 'arbitrary',
+    state: 'completed',
   }
   assert.deepEqual(await generic(payload), {
     action: 'create',

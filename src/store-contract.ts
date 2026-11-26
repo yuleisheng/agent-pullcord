@@ -1,10 +1,5 @@
 export type ErrorCode =
-  | 'not_found'
-  | 'claim_lost'
-  | 'invalid_transition'
-  | 'invalid_argument'
-  | 'request_id_reused'
-  | 'store_locked'
+  'not_found' | 'claim_lost' | 'invalid_transition' | 'invalid_argument' | 'request_id_reused' | 'store_locked'
 
 export class StoreError extends Error {
   readonly code: ErrorCode

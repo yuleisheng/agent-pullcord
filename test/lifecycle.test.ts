@@ -51,35 +51,56 @@ function send(store: Store, call: Call): Outcome {
 
 test('generated sequences keep the store equal to the lifecycle model', () => {
   let run = 0
-  fc.assert(fc.property(fc.array(operation, { maxLength: 80, size: 'max' }), (steps) => {
-    let now = 0
-    const store = openStore({ path: join(dir, `${run++}.db`), clock: () => now })
-    const model = new Model()
-    let cursor = 0
-    try {
-      for (const [i, step] of steps.entries()) {
-        let changed = false
-        if (step.t === 'advance') {
-          now += step.ms
-        } else if (step.t === 'ingest') {
-          const { created } = store.ingest({ queue: 'q', kind: 'k', source: 's', dedupeKey: `k${step.key}`, title: 't',
-            retry: step.retry, maxAttempts: step.max }, { actor: 'source:s' })
-          changed = model.ingest(step.key, step.retry, step.max, now)
-          assert.equal(created, changed)
-        } else {
-          const call = model.call(step, i)
-          const expected = model.apply(call, now)
-          assert.deepEqual(send(store, call), expected.outcome, `step ${i}: ${JSON.stringify(call)}`)
-          changed = expected.changed
+  fc.assert(
+    fc.property(fc.array(operation, { maxLength: 80, size: 'max' }), (steps) => {
+      let now = 0
+      const store = openStore({ path: join(dir, `${run++}.db`), clock: () => now })
+      const model = new Model()
+      let cursor = 0
+      try {
+        for (const [i, step] of steps.entries()) {
+          let changed = false
+          if (step.t === 'advance') {
+            now += step.ms
+          } else if (step.t === 'ingest') {
+            const { created } = store.ingest(
+              {
+                queue: 'q',
+                kind: 'k',
+                source: 's',
+                dedupeKey: `k${step.key}`,
+                title: 't',
+                retry: step.retry,
+                maxAttempts: step.max,
+              },
+              { actor: 'source:s' },
+            )
+            changed = model.ingest(step.key, step.retry, step.max, now)
+            assert.equal(created, changed)
+          } else {
+            const call = model.call(step, i)
+            const expected = model.apply(call, now)
+            assert.deepEqual(send(store, call), expected.outcome, `step ${i}: ${JSON.stringify(call)}`)
+            changed = expected.changed
+          }
+          const events = store.events()
+          assert.equal(
+            events.slice(cursor).filter((e) => e.type !== 'task.lease_expired').length,
+            changed ? 1 : 0,
+            `step ${i}: a write appends one event only when it changes something`,
+          )
+          cursor = events.length
+          checkInvariants(
+            model,
+            now,
+            store.tasks().tasks.map(({ id }) => store.task(id)),
+            events,
+          )
         }
-        const events = store.events()
-        assert.equal(events.slice(cursor).filter((e) => e.type !== 'task.lease_expired').length,
-          changed ? 1 : 0, `step ${i}: a write appends one event only when it changes something`)
-        cursor = events.length
-        checkInvariants(model, now, store.tasks().tasks.map(({ id }) => store.task(id)), events)
+      } finally {
+        store.close()
       }
-    } finally {
-      store.close()
-    }
-  }), { numRuns: 200 })
+    }),
+    { numRuns: 200 },
+  )
 })

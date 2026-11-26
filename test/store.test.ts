@@ -25,7 +25,14 @@ const A = { actor: 'agent-a' }
 const B = { actor: 'agent-b' }
 
 function incident(dedupeKey: string, extra: Partial<IngestInput> = {}): IngestInput {
-  return { queue: 'incidents/checkout', kind: 'incident', source: 'pagerduty', dedupeKey, title: `incident ${dedupeKey}`, ...extra }
+  return {
+    queue: 'incidents/checkout',
+    kind: 'incident',
+    source: 'pagerduty',
+    dedupeKey,
+    title: `incident ${dedupeKey}`,
+    ...extra,
+  }
 }
 
 function code(fn: () => unknown): string {
@@ -48,7 +55,11 @@ test('the same delivery twice makes one task', () => {
     store.events().map((e) => e.type),
     ['task.created'],
   )
-  assert.equal(store.ingest({ ...incident('P1'), source: 'github' }, { actor: 'source:github' }).created, true, 'the same dedupe key from another source is another task')
+  assert.equal(
+    store.ingest({ ...incident('P1'), source: 'github' }, { actor: 'source:github' }).created,
+    true,
+    'the same dedupe key from another source is another task',
+  )
 })
 
 test('a claim takes the oldest ready task that matches its queue and labels', () => {
@@ -56,7 +67,11 @@ test('a claim takes the oldest ready task that matches its queue and labels', ()
   const b = store.ingest(incident('P2', { labels: { urgency: 'high' } }), source).task
   const c = store.ingest(incident('P3', { queue: 'incidents/search', labels: { urgency: 'high' } }), source).task
 
-  assert.equal(store.claim({ queue: 'incidents', labels: {} }, A), null, 'a queue name matches exactly unless it ends with "/"')
+  assert.equal(
+    store.claim({ queue: 'incidents', labels: {} }, A),
+    null,
+    'a queue name matches exactly unless it ends with "/"',
+  )
   assert.equal(store.claim({ queue: 'incidents/', labels: { urgency: 'high' } }, A)?.id, b.id)
   assert.equal(store.claim({ queue: 'incidents/search' }, A)?.id, c.id)
   const claimed = store.claim({ queue: 'incidents/' }, B)
@@ -79,7 +94,10 @@ test('a holder write succeeds until its lease ends and fails from that moment', 
   assert.equal(renewed.leaseExpiresAt, now + 10_000)
   const before = store.events().length
   now += 10_000
-  assert.equal(code(() => store.complete(id, { ...A, epoch: claimed.epoch, result: 'done' })), 'claim_lost')
+  assert.equal(
+    code(() => store.complete(id, { ...A, epoch: claimed.epoch, result: 'done' })),
+    'claim_lost',
+  )
   assert.deepEqual(store.renew(id, renewal), renewed)
   assert.deepEqual(store.claim(filter, claimant), claimed)
 
@@ -106,8 +124,15 @@ test('an agent that stalled past its lease cannot settle a task another agent ho
   const fresh = store.claim({ queue: 'incidents/checkout' }, B)!
   assert.equal(fresh.epoch, stale.epoch + 1)
 
-  assert.equal(code(() => store.complete(id, { ...A, epoch: stale.epoch })), 'claim_lost')
-  assert.equal(code(() => store.complete(id, { ...A, epoch: fresh.epoch })), 'claim_lost', 'the right epoch is not enough without the claim')
+  assert.equal(
+    code(() => store.complete(id, { ...A, epoch: stale.epoch })),
+    'claim_lost',
+  )
+  assert.equal(
+    code(() => store.complete(id, { ...A, epoch: fresh.epoch })),
+    'claim_lost',
+    'the right epoch is not enough without the claim',
+  )
   assert.equal(store.complete(id, { ...B, epoch: fresh.epoch, result: 'fixed' }).state, 'completed')
 })
 
@@ -139,7 +164,11 @@ test('attempts are bounded: a safe task fails on its last expiry, a manual one w
   store.claim({ queue: 'incidents/checkout', leaseMs: 10_000 }, A)
   now += 10_000
   const interrupted = store.task(manual)
-  assert.deepEqual([interrupted.state, interrupted.attempts], ['interrupted', 1], 'a manual task out of attempts still waits for a person')
+  assert.deepEqual(
+    [interrupted.state, interrupted.attempts],
+    ['interrupted', 1],
+    'a manual task out of attempts still waits for a person',
+  )
   const requeued = store.requeue(manual, { actor: 'person:yulei' })
   assert.deepEqual([requeued.state, requeued.attempts], ['ready', 0], 'a requeue gives the attempt back')
   assert.equal(store.claim({ queue: 'incidents/checkout' }, B)?.id, manual)
@@ -164,13 +193,23 @@ test('a claim takes the task that has been ready longest', () => {
   const failed = store.claim({ queue: 'incidents/checkout' }, A)!
   now += 1
   store.fail(failed.id, { ...A, epoch: failed.epoch, reason: 'flaky', retry: true })
-  assert.notEqual(store.claim({ queue: 'incidents/checkout' }, B)?.id, failed.id, 'a retried task goes to the back of the queue')
+  assert.notEqual(
+    store.claim({ queue: 'incidents/checkout' }, B)?.id,
+    failed.id,
+    'a retried task goes to the back of the queue',
+  )
 })
 
 test('a lease is 10 seconds to 1 hour', () => {
   store.ingest(incident('P1'), source)
-  assert.equal(code(() => store.claim({ queue: 'incidents/checkout', leaseMs: 9_999 }, A)), 'invalid_argument')
-  assert.equal(code(() => store.claim({ queue: 'incidents/checkout', leaseMs: 3_600_001 }, A)), 'invalid_argument')
+  assert.equal(
+    code(() => store.claim({ queue: 'incidents/checkout', leaseMs: 9_999 }, A)),
+    'invalid_argument',
+  )
+  assert.equal(
+    code(() => store.claim({ queue: 'incidents/checkout', leaseMs: 3_600_001 }, A)),
+    'invalid_argument',
+  )
   assert.equal(store.claim({ queue: 'incidents/checkout', leaseMs: 10_000 }, A)?.leaseExpiresAt, now + 10_000)
 })
 
@@ -182,7 +221,10 @@ test('release and block give the attempt back', () => {
   const blocked = store.block(id, { ...A, epoch: claim.epoch, reason: 'approve the rollback?' })
   assert.deepEqual([blocked.state, blocked.attempts, blocked.reason], ['blocked', 0, 'approve the rollback?'])
   assert.equal(store.claim({ queue: 'incidents/checkout' }, B), null)
-  assert.equal(code(() => store.requeue(id, B)), 'invalid_transition')
+  assert.equal(
+    code(() => store.requeue(id, B)),
+    'invalid_transition',
+  )
   store.unblock(id, { actor: 'person:yulei' })
   assert.equal(store.claim({ queue: 'incidents/checkout' }, B)?.attempts, 1)
 })
@@ -191,7 +233,10 @@ test('a canceled task stays canceled, and its holder loses the claim', () => {
   const id = store.ingest(incident('P1'), source).task.id
   const { epoch } = store.claim({ queue: 'incidents/checkout' }, A)!
   assert.equal(store.cancel(id, { ...source, reason: 'resolved in PagerDuty' }).state, 'canceled')
-  assert.equal(code(() => store.complete(id, { ...A, epoch })), 'claim_lost')
+  assert.equal(
+    code(() => store.complete(id, { ...A, epoch })),
+    'claim_lost',
+  )
   for (const write of [
     () => store.cancel(id, { ...source, reason: 'again' }),
     () => store.unblock(id, source),
@@ -213,21 +258,31 @@ test('a write repeated with its request ID returns the first result and changes 
   assert.deepEqual(store.complete(id, { ...A, epoch: claim.epoch, result: 'fixed', requestId: 'r1' }), done)
   assert.equal(store.events().length, events)
 
-  assert.equal(code(() => store.log(id, { ...A, text: 'note', requestId: 'r1' })), 'request_id_reused')
+  assert.equal(
+    code(() => store.log(id, { ...A, text: 'note', requestId: 'r1' })),
+    'request_id_reused',
+  )
   assert.equal(
     code(() => store.complete(id, { ...A, epoch: claim.epoch, result: 'something else', requestId: 'r1' })),
     'request_id_reused',
     'the same request ID with different arguments is a different write',
   )
   const beforeLog = store.events().length
-  assert.equal(store.log(id, { ...B, text: 'note', requestId: 'r1' }).type, 'task.logged', 'request IDs belong to their actor')
+  assert.equal(
+    store.log(id, { ...B, text: 'note', requestId: 'r1' }).type,
+    'task.logged',
+    'request IDs belong to their actor',
+  )
   assert.equal(store.events().length, beforeLog + 1, 'a log appends one event')
   assert.equal(store.task(id).state, 'completed', 'a log changes no state')
 })
 
 test('the first memo wins', () => {
   const id = store.ingest(incident('P1'), source).task.id
-  assert.deepEqual(store.memo(id, 'approval:rollback', { approved: true, by: 'yulei' }, { actor: 'person:yulei' }), { approved: true, by: 'yulei' })
+  assert.deepEqual(store.memo(id, 'approval:rollback', { approved: true, by: 'yulei' }, { actor: 'person:yulei' }), {
+    approved: true,
+    by: 'yulei',
+  })
   assert.deepEqual(store.memo(id, 'approval:rollback', { approved: false }, A), { approved: true, by: 'yulei' })
   assert.deepEqual(store.task(id).memos, { 'approval:rollback': { approved: true, by: 'yulei' } })
   assert.equal(store.events().filter((e) => e.type === 'task.memo').length, 1)
@@ -238,7 +293,11 @@ function openInChild(path: string): string {
     import { openStore } from ${JSON.stringify(new URL('../src/store.ts', import.meta.url).href)}
     try { openStore({ path: ${JSON.stringify(path)} }).close(); console.log('opened') } catch (error) { console.log(error.code) }
   `
-  const child = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', '--input-type=module', '-e', script], { encoding: 'utf8' })
+  const child = spawnSync(
+    process.execPath,
+    ['--disable-warning=ExperimentalWarning', '--input-type=module', '-e', script],
+    { encoding: 'utf8' },
+  )
   assert.equal(child.status, 0, child.stderr)
   return child.stdout.trim()
 }
@@ -269,7 +328,11 @@ test('a reader resumes from its cursor after the hub is killed', () => {
     store.claim({ queue: 'q' }, { actor: 'agent-a' })
     process.kill(process.pid, 'SIGKILL')
   `
-  const child = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', '--input-type=module', '-e', script], { encoding: 'utf8' })
+  const child = spawnSync(
+    process.execPath,
+    ['--disable-warning=ExperimentalWarning', '--input-type=module', '-e', script],
+    { encoding: 'utf8' },
+  )
   assert.equal(child.signal, 'SIGKILL', child.stderr)
   const cursor = Number(child.stdout.trim())
   assert.equal(cursor, 1)
